@@ -112,6 +112,13 @@ module cv_adamnet
    input logic [7:0]            disk_data[TOT_DISKS],
    output logic [7:0]           disk_din,
 
+   // Printer (AdamNet device 2). One byte per prn_strobe, taken from the DCB
+   // buffer in order. A byte is only fetched while prn_ready is high, so a
+   // FIFO behind this can hold the Z80 off by filling up.
+   output logic [7:0]           prn_data,
+   output logic                 prn_strobe,
+   input logic                  prn_ready,
+
    output logic                 adamnet_req_n,
    input logic                  adamnet_ack_n,
    output logic                 adamnet_wait_n,
@@ -251,6 +258,14 @@ module cv_adamnet
   logic         kbd_partial;  // completed a CMD_READ with fewer keys than asked
   logic [3:0]   kbd_dev;
 
+  // Printer
+  logic         prn_req;    // CMD_WRITE to the printer: start sending the buffer
+  logic         prn_busy;   // that write has not finished yet
+  logic         prn_done;   // the last byte has gone out
+  logic [15:0]  prn_buf;
+  logic [15:0]  prn_len;
+  logic [3:0]   prn_dev;
+
   assign max_dcb = pcb_table.pcb_max_dcb;
   typedef enum bit
                {
@@ -335,6 +350,7 @@ module cv_adamnet
     disk_req       <= '0;
     tape_req       <= '0;
     kbd_req        <= '0;
+    prn_req        <= '0;
 
     for (int i = 0; i < 15; i++) begin
       dcb_base_cmd[i]    <= (pcb_base + PCB_SIZE) + i * DCB_SIZE;
@@ -483,16 +499,27 @@ module cv_adamnet
                           dcb_table[dcb_dev].dcb_cmd_stat <= RSP_BUSY; // RSP_ACK + 8'h0B;
                         end
                         CMD_WRITE: begin
-                          //dcb_table[dcb_dev].dcb_cmd_stat <= '0;
-                          dcb_table[dcb_dev].dcb_cmd_stat <= RSP_STATUS;
-                          //for(J=0 ; (J<N) && (V=GetKBD()) ; ++J, A=(A+1)&0xFFFF)
-                          //  RAM(A) = V;
+                          // ColEm's UpdatePRN sends DCB length bytes from the DCB buffer. Here
+                          // the status stays 00h (in progress) until the last byte has been
+                          // taken, the way a disk transfer reports, so a full printer FIFO
+                          // holds EOS off instead of losing characters.
+                          dcb_table[dcb_dev].dcb_cmd_stat <= '0;
+                          prn_req  <= '1;
+                          prn_busy <= '1;
+                          prn_buf  <= {dcb_table[dcb_dev].dcb_ba_hi, dcb_table[dcb_dev].dcb_ba_lo};
+                          prn_len  <= {dcb_table[dcb_dev].dcb_buf_len_hi, dcb_table[dcb_dev].dcb_buf_len_lo};
+                          prn_dev  <= dcb_dev;
+`ifdef ADAMNET_TRACE
+                          $display("Adamnet trace: PRN dcb %0d write buf %02x%02x len %02x%02x",
+                                   dcb_dev, dcb_table[dcb_dev].dcb_ba_hi, dcb_table[dcb_dev].dcb_ba_lo,
+                                   dcb_table[dcb_dev].dcb_buf_len_hi, dcb_table[dcb_dev].dcb_buf_len_lo);
+`endif
                         end
                         default: begin
                           dcb_table[dcb_dev].dcb_cmd_stat <= RSP_STATUS;
                         end
                       endcase
-                    end else if (z80_rd_lvl) begin // if (z80_wr)
+                    end else if (z80_rd_lvl && !prn_busy) begin // if (z80_wr)
                       dcb_table[dcb_dev].dcb_cmd_stat <= RSP_STATUS;
                     end
                   end else if (is_dsk[0][dcb_dev]) begin
@@ -677,6 +704,10 @@ module cv_adamnet
     if (disk_done) dcb_table[done_dev].dcb_cmd_stat <= RSP_STATUS;
     // short read (fewer keys than requested) reports RSP_STATUS + 0x0C, as ColEm does
     if (kbd_done)  dcb_table[kbd_dev].dcb_cmd_stat <= kbd_partial ? (RSP_STATUS + 8'h0C) : RSP_STATUS;
+    if (prn_done) begin
+      dcb_table[prn_dev].dcb_cmd_stat <= RSP_STATUS;
+      prn_busy                        <= '0;
+    end
     if (set_lastblock) begin
       disk_lastblock[done_dev] <= sec;
     end
@@ -688,6 +719,7 @@ module cv_adamnet
       relocating     <= '0;
       adamnet_wait_n <= '1;
       kbd_status     <= RSP_STATUS;
+      prn_busy       <= '0;
     end
   end
 
@@ -699,6 +731,7 @@ module cv_adamnet
     adamnet_req_n  = '1;
     adamnet_wait_n = '1;
     kbd_status     = RSP_STATUS;
+    prn_busy       = '0;
   end
 
   logic pcb_hit;
@@ -772,6 +805,24 @@ module cv_adamnet
 
   kbd_state_t kbd_state;
 
+  // Printer fetch. It reads the DCB buffer through the same RAM port as the
+  // disk and keyboard, but only while neither of them wants it: a disk or tape
+  // block and a key delivery always win, and a byte whose read they interrupt
+  // is simply read again. Port B of the RAM is registered, so the address has
+  // to sit still for two clocks before ramb_din holds the byte.
+  typedef enum bit [1:0]
+               {
+                PRN_IDLE,
+                PRN_NEXT,
+                PRN_FETCH1,
+                PRN_FETCH2
+                } prn_state_t;
+
+  prn_state_t  prn_state;
+  logic [15:0] prn_addr;
+  logic [15:0] prn_left;
+  logic        prn_port_free;
+
   logic        lastpress;
   logic        press_btn;
   logic [7:0]  code;
@@ -814,9 +865,11 @@ module cv_adamnet
     disk_state = DISK_IDLE;
     tape_state = DISK_IDLE;
     kbd_state  = KBD_IDLE;
+    prn_state  = PRN_IDLE;
   end
 
   assign watch_key = (kbd_state == KBD_KEY) && (disk_state == DISK_IDLE) && !kbd_empty;
+  assign prn_port_free = (disk_state == DISK_IDLE) && !disk_req && !tape_req && !watch_key;
 
   assign disk_sector = disk_active ? {disk_sec[31:3], InterleaveTable(disk_sec[2:0])} : disk_sec;
 
@@ -834,6 +887,8 @@ module cv_adamnet
     disk_wr          <= '0;
     disk_flush       <= '0;
     kbd_done         <= '0;
+    prn_strobe       <= '0;
+    prn_done         <= '0;
     kbd_sel          <= watch_key;
     adamnet_req_n    <= '1;
     set_lastblock    <= '0;
@@ -986,6 +1041,48 @@ module cv_adamnet
       default: begin
       end
     endcase
+
+    // Printer: comes after the disk case so its RAM address overrides the idle default
+    if (prn_req) begin
+      prn_addr  <= prn_buf;
+      prn_left  <= prn_len;
+      prn_state <= PRN_NEXT;
+    end else begin
+      case (prn_state)
+        PRN_NEXT: begin
+          if (prn_left == 0) begin
+            prn_done  <= '1;
+            prn_state <= PRN_IDLE;
+          end else if (prn_port_free && prn_ready) begin
+            ramb_addr <= prn_addr;
+            prn_state <= PRN_FETCH1;
+          end
+        end
+        PRN_FETCH1: begin
+          if (prn_port_free) begin
+            ramb_addr <= prn_addr;
+            prn_state <= PRN_FETCH2;
+          end else begin
+            prn_state <= PRN_NEXT;
+          end
+        end
+        PRN_FETCH2: begin
+          if (prn_port_free) begin
+            ramb_addr  <= prn_addr;
+            prn_data   <= ramb_din;
+            prn_strobe <= '1;
+            prn_addr   <= prn_addr + 1'b1;
+            prn_left   <= prn_left - 1'b1;
+`ifdef ADAMNET_TRACE
+            $display("Adamnet trace: PRN byte %02x from %04x", ramb_din, prn_addr);
+`endif
+          end
+          prn_state <= PRN_NEXT;
+        end
+        default: begin
+        end
+      endcase
+    end
 
     lastpress <= ps2_key[10];
     if(lastpress != ps2_key[10]) begin

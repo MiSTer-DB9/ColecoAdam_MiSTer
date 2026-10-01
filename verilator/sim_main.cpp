@@ -18,6 +18,35 @@
 
 #if VERILATOR_MAJOR_VERSION >= 5
 #define VERTOPINTERN top->rootp
+
+static FILE* printer_fp = nullptr;      // --printer FILE: raw bytes sent to the AdamNet printer
+static int printer_baud = 0;            // --printer-baud N: take them from the UART instead
+
+// 8N1 receiver for --printer-baud, clocked at the sim's 10.7 MHz. Samples mid-bit.
+struct PrinterRx {
+        double next = 0;
+        long clock = 0;
+        int bit = -2;           // -2 idle, -1 start bit, 0-7 data, 8 stop
+        int value = 0;
+        void step(int txd, FILE* out) {
+                clock++;
+                double bit_clocks = 10738635.0 / printer_baud;
+                if (bit == -2) {
+                        if (!txd) { bit = -1; value = 0; next = clock + bit_clocks / 2; }
+                        return;
+                }
+                if (clock < next) return;
+                next += bit_clocks;
+                if (bit == -1) { bit = txd ? -2 : 0; return; }
+                if (bit < 8) { value |= txd << bit; bit++; return; }
+                if (!txd) fprintf(stderr, "printer UART: framing error\n");
+                fputc(value, out);
+                fflush(out);
+                bit = -2;
+        }
+};
+static PrinterRx printer_rx;
+static long printer_held = 0;           // clocks the full FIFO held the ADAM off
 #else
 #define VERTOPINTERN top
 #endif
@@ -369,6 +398,7 @@ int verilate() {
                 VERTOPINTERN->exp_ram = exp_ram_mode;
                 // --spin drives the spinner device path, like the OSD's "Spinner" setting
                 VERTOPINTERN->spin_mode = spin_mode_opt;
+                VERTOPINTERN->prn_baud = printer_baud;
 
                 // Simulate both edges of system clock
                 if (clk_sys.clk != clk_sys.old) {
@@ -382,6 +412,19 @@ int verilate() {
                         }
                         top->eval();
                         if (clk_sys.clk) { bus.AfterEval(); blockdevice.AfterEval(); }
+                }
+
+                // The core strobes one printer byte per clock; keep them raw, as the printer got them.
+                // With --printer-baud they come off the UART instead, as the HPS would receive them.
+                if (clk_sys.IsRising() && printer_fp) {
+                        if (printer_baud) {
+                                printer_rx.step(VERTOPINTERN->PRN_TXD, printer_fp);
+                                if (!VERTOPINTERN->PRN_READY) printer_held++;
+                        }
+                        else if (VERTOPINTERN->PRN_STROBE) {
+                                fputc(VERTOPINTERN->PRN_DATA, printer_fp);
+                                fflush(printer_fp);
+                        }
                 }
 
 #ifndef DISABLE_AUDIO
@@ -1065,6 +1108,9 @@ void usage(const char* prog) {
                 "  --headless             run without a window; requires --frames\n"
                 "  --record FILE         write controller input to FILE while you play in the GUI\n"
                 "  --replay FILE         drive the controller from a FILE written by --record\n"
+                "  --printer FILE        write the bytes the Adam sends its printer to FILE, raw\n"
+                "  --printer-baud N      send them through the core's printer FIFO and UART at N baud\n"
+                "                        (a 16 byte FIFO in the sim, so printing gets held off)\n"
                 "  --capture-dir DIR     where F5/F6/F7 write captures (default ./captures)\n"
                 "                        F5 start capturing, F6 stop, F7 grab this frame;\n"
                 "                        each writes cap_NNNNN.ppm and cap_NNNNN.vdp (regs+VRAM)\n"
@@ -1117,6 +1163,12 @@ void parseArgs(int argc, char** argv) {
                         if (!record_fp) { fprintf(stderr, "cannot write %s\n", path.c_str()); exit(1); }
                 }
                 else if (arg == "--replay") { loadReplay(value()); }
+                else if (arg == "--printer-baud") { printer_baud = atoi(value().c_str()); }
+                else if (arg == "--printer") {
+                        std::string path = value();
+                        printer_fp = fopen(path.c_str(), "wb");
+                        if (!printer_fp) { fprintf(stderr, "cannot write %s\n", path.c_str()); exit(1); }
+                }
                 else if (arg == "--capture-dir") { capture_dir = value(); }
                 else if (arg == "--capture-frames") {
                         std::string v = value();
@@ -1283,6 +1335,7 @@ int runHeadless() {
         }
 
         printf("frames=%d main_time=%llu seconds=%.1f fps=%.2f\n", last_frame, (unsigned long long)main_time, seconds, last_frame / seconds);
+        if (printer_baud) printf("printer FIFO full for %ld clocks\n", printer_held);
         top->final();
         return 0;
 }

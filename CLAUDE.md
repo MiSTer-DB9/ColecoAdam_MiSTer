@@ -21,6 +21,7 @@ git.
 | `rtl/cv_ctrl.sv` | Controller ports: keypad/joystick select, the port read mux, and the spinner strobe and interrupt. `cv_ctrl.vhd` is the older VHDL, no longer built |
 | `rtl/cv_spinner.sv` | Turns a spinner device or an analog axis into the pin 7/9 signalling of Coleco's roller controllers |
 | `rtl/cv_adamnet.sv` | AdamNet devices and the PS/2 to ADAM key tables |
+| `rtl/cv_printer_uart.sv` | Printer FIFO and 8N1 transmitter to the HPS UART, active when the OSD's UART connection is Printer (mode 7); `mister_printerd` in the peer `printeremulation` repo makes the PDF. `verilator/printer_tb/` tests it |
 | `rtl/track_loader_adam.sv` | Moves disk/tape blocks between AdamNet and the SD image |
 | `rtl/vdp18v/` | TMS9918A (SystemVerilog). `rtl/vdp18/` is the older VHDL |
 | `rtl/tv80/` | Z80 used by both hardware and simulation. `rtl/T80/` is unused. `TV80_REFRESH` is its only `ifdef` and is `define`d in `tv80_core.v` and `tv80e.v` themselves, not in the `.qsf` or the simulator Makefile: it went undefined in both build systems for years, which left the R register non-existent and `LD A,R` returning 0. Don't move it back into a build file |
@@ -62,8 +63,10 @@ Options: `--cart`, `--console`/`--adam`, `--headless`, `--frames N`, `--shots F1
 `--exp-ram 64|256|512|1024|2048|none` (memory expander, matching the OSD's Expansion RAM option),
 `--spin STEPS@FRAME[:N]` and `--spin2` (roller/spinner, matching the OSD's Spinner option),
 `--peek [v:]ADDR[:N]@FRAME` (print RAM bytes by Z80 address, `v:` for VRAM; console mode mirrors
-its 1K so 7038h is index 6038h), `--record FILE` and `--replay FILE`. Frames are saved as
-320×240 PPMs.
+its 1K so 7038h is index 6038h), `--printer FILE` (the raw bytes EOS sends AdamNet printer
+device 2; the ColEm harness in `compare/` takes the same option; add `--printer-baud N` to
+take them off the core's UART through a 16-byte FIFO, which holds the ADAM off), `--record FILE`
+and `--replay FILE`. Frames are saved as 320×240 PPMs.
 
 `--record`/`--replay` are for faults somewhere a scripted `--press` cannot reach. Play the game
 in the GUI with `--record`, which writes one `frame bits` line per input change, then re-run the

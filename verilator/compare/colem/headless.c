@@ -227,7 +227,7 @@ static void Usage(const char *Prog)
     "Usage: %s [--cart FILE] --bios FILE --frames N [--shots F1,F2,...] [--every K]\n"
     "          --outdir DIR [--press KEY@FRAME[:DUR]]...\n"
     "          [--adam --writer FILE --eos FILE] [--disk N FILE] [--tape N FILE]\n"
-    "          [--type TEXT@FRAME] [--key NAME@FRAME]\n"
+    "          [--type TEXT@FRAME] [--key NAME@FRAME] [--printer FILE]\n"
     "KEY: 0-9 star pound up down left right fire1 fire2\n"
     "NAME: enter esc bs tab space up down left right home f1-f6 undo wildcard\n"
     "      move store insert print clear delete\n",Prog);
@@ -236,7 +236,7 @@ static void Usage(const char *Prog)
 
 int main(int argc,char *argv[])
 {
-  const char *Cart = 0,*Bios = 0;
+  const char *Cart = 0,*Bios = 0,*PrinterFile = 0;
   int Adam = 0;
   unsigned char Hdr[2];
   FILE *F;
@@ -252,6 +252,7 @@ int main(int argc,char *argv[])
     else if(!strcmp(A,"--frames")&&V) { MaxFrames=atoi(V);++N; }
     else if(!strcmp(A,"--every")&&V)  { Every=atoi(V);++N; }
     else if(!strcmp(A,"--outdir")&&V) { OutDir=V;++N; }
+    else if(!strcmp(A,"--printer")&&V) { PrinterFile=V;++N; }
     else if(!strcmp(A,"--shots")&&V)
     {
       char *Copy = strdup(V),*T;
@@ -349,7 +350,14 @@ int main(int argc,char *argv[])
   UPeriod   = 100;
   Mode      = CV_NTSC|CV_PALETTE0|(Adam? CV_ADAM:0);
   SndName   = 0;
-  PrnName   = "/dev/null";  /* SmartWriter prints as you type; keep stdout for the summary */
+  /* SmartWriter prints as you type; keep stdout for the summary. ColEm appends to the
+     printer file, so --printer starts it empty to match the simulator's --printer. */
+  if(PrinterFile)
+  {
+    if(!(F=fopen(PrinterFile,"wb"))) { fprintf(stderr,"Cannot write %s\n",PrinterFile);return(2); }
+    fclose(F);
+  }
+  PrnName   = PrinterFile? PrinterFile:"/dev/null";
   PalName   = 0;
   HomeDir   = 0;
   BiosName  = Bios;

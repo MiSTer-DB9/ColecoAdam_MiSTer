@@ -187,7 +187,7 @@ module emu
 
 assign ADC_BUS = 'Z;
 assign USER_OUT = '1;
-assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
 
@@ -218,7 +218,7 @@ video_freak video_freak
 
 `include "build_id.v"
 parameter CONF_STR = {
-        "Adam;;",
+        "Adam;UART115200:57600:38400:19200:9600;",
         "-;",
         "F,COLBINROM,Load CART;",
         "S0,DSK,Load Floppy 1;",
@@ -309,10 +309,16 @@ wire [15:0] joy1_l_analog, joy1_r_analog;
 
 wire  [8:0] spinner_0, spinner_1;
 
+wire  [7:0] uart_mode;
+wire [31:0] uart_speed;
+
 hps_io #(.CONF_STR(CONF_STR), .VDNUM(TOT_DISKS)) hps_io
 (
    .clk_sys(clk_sys),
    .HPS_BUS(HPS_BUS),
+
+   .uart_mode(uart_mode),
+   .uart_speed(uart_speed),
 
    .buttons(buttons),
    .status(status),
@@ -649,6 +655,27 @@ wire mode=~status[12];
   logic [7:0]           disk_data[TOT_DISKS];
   logic [7:0]           disk_din;
 
+
+// ADAM printer (AdamNet device 2) out through the HPS UART. When the OSD's UART
+// connection is Printer (mode 7), mister_printerd reads the stream and writes a PDF;
+// in any other mode the bytes are dropped rather than sent into, say, the Linux
+// console on that port, and the ADAM prints as if nothing were attached.
+wire [7:0] prn_data;
+wire       prn_strobe;
+wire       prn_ready;
+
+cv_printer_uart #(.CLK_HZ(42_666_000)) printer_uart
+(
+        .clk(clk_sys),
+        .reset(RESET),
+        .enable(uart_mode == 8'd7),
+        .baud(uart_speed),
+        .din(prn_data),
+        .wr(prn_strobe),
+        .ready(prn_ready),
+        .txd(UART_TXD)
+);
+
 cv_console
     #
     (
@@ -718,6 +745,10 @@ cv_console
         .ramb_dout(ramb_dout),
         .ramb_wr_ack(ramb_wr_ack),
         .ramb_rd_ack(ramb_rd_ack),
+
+        .prn_data(prn_data),
+        .prn_strobe(prn_strobe),
+        .prn_ready(prn_ready),
 
         .vram_a_o(vram_a),
         .vram_we_o(vram_we),

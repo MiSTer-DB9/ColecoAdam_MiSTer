@@ -67,6 +67,7 @@ V_SRC = \
 	../rtl/cv_addr_dec.sv \
 	../rtl/cv_console.sv \
 	../rtl/cv_adamnet.sv \
+	../rtl/cv_printer_uart.sv \
 	../rtl/cv_por.sv	 \
 	../rtl/vdp18v/vdp18_pkg.sv \
 	../rtl/vdp18v/vdp18_clk_gen.sv \

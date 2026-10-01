@@ -84,6 +84,15 @@ module emu
    output [15:0]         AUDIO_L,
    output [15:0]         AUDIO_R,
 
+   // AdamNet printer bytes, one per PRN_STROBE clock (--printer writes them to a file)
+   output [7:0]          PRN_DATA,
+   output                PRN_STROBE,
+   // --printer-baud: the same bytes through the hardware's FIFO and UART, which then
+   // hold the ADAM off whenever the FIFO fills. 0 leaves the UART off and ready high.
+   input [31:0]          prn_baud,
+   output                PRN_TXD,
+   output                PRN_READY,
+
    input                 ioctl_download,
    input                 ioctl_wr,
    input [24:0]          ioctl_addr,
@@ -498,6 +507,22 @@ wire  [7:0] ext_rom_d=8'hff;
      else if (soft_reset) game_reset <= 0;
   end
 
+  // The sim clock is the 10.7 MHz rate itself. A 16 byte FIFO, not the hardware's
+  // 512, so an ordinary SmartWriter print fills it and exercises the hold-off.
+  wire prn_ready;
+  assign PRN_READY = prn_ready;
+  cv_printer_uart #(.CLK_HZ(10_738_635), .FIFO_AW(4)) printer_uart
+  (
+     .clk(clk_sys),
+     .reset(1'b0),
+     .enable(prn_baud != 0),
+     .baud(prn_baud),
+     .din(PRN_DATA),
+     .wr(PRN_STROBE),
+     .ready(prn_ready),
+     .txd(PRN_TXD)
+  );
+
   cv_console
     #
     (
@@ -571,6 +596,10 @@ wire  [7:0] ext_rom_d=8'hff;
      .ramb_din(ramb_din),
      .ramb_wr_ack(ramb_wr_ack),
      .ramb_rd_ack(ramb_rd_ack),
+
+     .prn_data(PRN_DATA),
+     .prn_strobe(PRN_STROBE),
+     .prn_ready(prn_ready),
 
      .vram_a_o(vram_a),
      .vram_we_o(vram_we),

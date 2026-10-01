@@ -134,6 +134,10 @@ module cv_console
    input        [7:0]           ramb_din,
    input                        ramb_wr_ack,
    input                        ramb_rd_ack,
+   // AdamNet printer: one byte per prn_strobe, fetched only while prn_ready
+   output logic [7:0]           prn_data,
+   output logic                 prn_strobe,
+   input                        prn_ready,
 
    // Video RAM Interface ----------------------------------------------------
    output [13:0]                vram_a_o,
@@ -602,6 +606,10 @@ module cv_console
      .disk_error, // out of bounds (?)
      .disk_data,
      .disk_din,
+
+     .prn_data,
+     .prn_strobe,
+     .prn_ready,
 
      .adamnet_req_n,
      .adamnet_ack_n,
