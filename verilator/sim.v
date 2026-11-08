@@ -92,6 +92,11 @@ module emu
    input [31:0]          prn_baud,
    output                PRN_TXD,
    output                PRN_READY,
+   // --fujinet: the AdamNet wire to FujiNet-PC, through the core's UART at fuji_baud.
+   // 0 leaves FujiNet off and every device emulated here.
+   input [31:0]          fuji_baud,
+   output                FUJI_TXD,
+   input                 FUJI_RXD,
 
    input                 ioctl_download,
    input                 ioctl_wr,
@@ -523,12 +528,37 @@ wire  [7:0] ext_rom_d=8'hff;
      .txd(PRN_TXD)
   );
 
+  // FujiNet link, as in ColecoAdam.sv but at the sim's clock rate
+  wire       fuji_en = (fuji_baud != 0);
+  wire [7:0] fuji_tx_data;
+  wire       fuji_tx_wr, fuji_tx_busy;
+  wire [7:0] fuji_rx_data;
+  wire       fuji_rx_avail, fuji_rx_rd, fuji_rx_flush;
+  cv_fuji_uart #(.CLK_HZ(10_738_635)) fuji_uart
+  (
+     .clk(clk_sys),
+     .reset(1'b0),
+     .enable(fuji_en),
+     .baud(fuji_baud),
+     .tx_data(fuji_tx_data),
+     .tx_wr(fuji_tx_wr),
+     .tx_busy(fuji_tx_busy),
+     .rx_data(fuji_rx_data),
+     .rx_avail(fuji_rx_avail),
+     .rx_rd(fuji_rx_rd),
+     .rx_flush(fuji_rx_flush),
+     .rx_err(),
+     .txd(FUJI_TXD),
+     .rxd(FUJI_RXD)
+  );
+
   cv_console
     #
     (
      .NUM_DISKS (NUM_DISKS),
      .NUM_TAPES (NUM_TAPES),
-     .USE_REQ   (USE_REQ)
+     .USE_REQ   (USE_REQ),
+     .CLK_HZ    (10_738_635)
      )
   console
     (
@@ -600,6 +630,15 @@ wire  [7:0] ext_rom_d=8'hff;
      .prn_data(PRN_DATA),
      .prn_strobe(PRN_STROBE),
      .prn_ready(prn_ready),
+
+     .fuji_en(fuji_en),
+     .fuji_tx_data(fuji_tx_data),
+     .fuji_tx_wr(fuji_tx_wr),
+     .fuji_tx_busy(fuji_tx_busy),
+     .fuji_rx_data(fuji_rx_data),
+     .fuji_rx_avail(fuji_rx_avail),
+     .fuji_rx_rd(fuji_rx_rd),
+     .fuji_rx_flush(fuji_rx_flush),
 
      .vram_a_o(vram_a),
      .vram_we_o(vram_we),

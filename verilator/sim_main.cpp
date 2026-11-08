@@ -47,6 +47,7 @@ struct PrinterRx {
 };
 static PrinterRx printer_rx;
 static long printer_held = 0;           // clocks the full FIFO held the ADAM off
+static bool no_media = false;           // --no-media: don't mount adam.dsk/adam.ddp by default
 #else
 #define VERTOPINTERN top
 #endif
@@ -59,6 +60,7 @@ static long printer_held = 0;           // clocks the full FIFO held the ADAM of
 #include "sim_input.h"
 #include "sim_clock.h"
 #include "sim_adam_keys.h"
+#include "sim_fujinet.h"
 
 #include "../imgui/imgui_memory_editor.h"
 #include "../imgui/ImGuiFileDialog.h"
@@ -382,7 +384,8 @@ int verilate() {
 
                 // Hold reset while a ROM downloads, like ColecoAdam.sv does
                 static bool was_downloading = false;
-                bool downloading = bus.HasQueue() || *bus.ioctl_download;
+                // ...and, with --fujinet, until FujiNet-PC has connected, so the boot scan finds its drive
+                bool downloading = bus.HasQueue() || *bus.ioctl_download || fujinet.holding_reset();
                 // Assert reset during startup
                 if (main_time < initialReset || downloading) { VERTOPINTERN->reset = 1; }
                 // Deassert reset after startup, or when a download finishes
@@ -399,6 +402,7 @@ int verilate() {
                 // --spin drives the spinner device path, like the OSD's "Spinner" setting
                 VERTOPINTERN->spin_mode = spin_mode_opt;
                 VERTOPINTERN->prn_baud = printer_baud;
+                VERTOPINTERN->fuji_baud = fujinet.enabled() ? fujinet.baud : 0;
 
                 // Simulate both edges of system clock
                 if (clk_sys.clk != clk_sys.old) {
@@ -425,6 +429,12 @@ int verilate() {
                                 fputc(VERTOPINTERN->PRN_DATA, printer_fp);
                                 fflush(printer_fp);
                         }
+                }
+
+                // FujiNet: the core's UART pins to and from the Bus-over-IP socket
+                if (clk_sys.IsRising() && fujinet.enabled()) {
+                        fujinet.step(VERTOPINTERN->FUJI_TXD, video.count_frame);
+                        VERTOPINTERN->FUJI_RXD = fujinet.rxd();
                 }
 
 #ifndef DISABLE_AUDIO
@@ -1057,6 +1067,7 @@ void stepSim() {
 
         if (video.count_frame == last_frame) { return; }
         last_frame = video.count_frame;
+        if (fujinet.enabled()) { fujinet.end_frame(last_frame); }
 
         if (headless) {
                 uint32_t rp1 = 0, rp2 = 0;
@@ -1111,6 +1122,15 @@ void usage(const char* prog) {
                 "  --printer FILE        write the bytes the Adam sends its printer to FILE, raw\n"
                 "  --printer-baud N      send them through the core's printer FIFO and UART at N baud\n"
                 "                        (a 16 byte FIFO in the sim, so printing gets held off)\n"
+                "  --fujinet [PORT]      FujiNet: listen on TCP PORT (default 65216) for FujiNet-PC's ADAM\n"
+                "                        build, which connects to it as its Bus-over-IP peer, and hold\n"
+                "                        reset until it does (30 s at most). Devices FujiNet serves go\n"
+                "                        over the wire, as with the OSD's UART connection set to FujiNet\n"
+                "  --fujinet-baud N      the core's UART rate on that link (default 115200)\n"
+                "  --fujinet-log FILE    log every byte each way, with the frame number\n"
+                "  --fujinet-verbose     hexdump each frame's traffic on stdout\n"
+                "  --fujinet-nowait      don't hold reset for FujiNet-PC\n"
+                "  --no-media            don't mount adam.dsk/adam.ddp from the current directory\n"
                 "  --capture-dir DIR     where F5/F6/F7 write captures (default ./captures)\n"
                 "                        F5 start capturing, F6 stop, F7 grab this frame;\n"
                 "                        each writes cap_NNNNN.ppm and cap_NNNNN.vdp (regs+VRAM)\n"
@@ -1164,6 +1184,20 @@ void parseArgs(int argc, char** argv) {
                 }
                 else if (arg == "--replay") { loadReplay(value()); }
                 else if (arg == "--printer-baud") { printer_baud = atoi(value().c_str()); }
+                else if (arg == "--fujinet") {
+                        // the port is optional: only a number is taken as one
+                        fujinet.port = 65216;
+                        if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') fujinet.port = atoi(argv[++i]);
+                }
+                else if (arg == "--fujinet-baud") { fujinet.baud = atoi(value().c_str()); }
+                else if (arg == "--fujinet-log") {
+                        std::string path = value();
+                        fujinet.log = fopen(path.c_str(), "w");
+                        if (!fujinet.log) { fprintf(stderr, "cannot write %s\n", path.c_str()); exit(1); }
+                }
+                else if (arg == "--fujinet-verbose") { fujinet.verbose = true; }
+                else if (arg == "--fujinet-nowait") { fujinet.wait_for_peer = false; }
+                else if (arg == "--no-media") { no_media = true; }
                 else if (arg == "--printer") {
                         std::string path = value();
                         printer_fp = fopen(path.c_str(), "wb");
@@ -1336,6 +1370,7 @@ int runHeadless() {
 
         printf("frames=%d main_time=%llu seconds=%.1f fps=%.2f\n", last_frame, (unsigned long long)main_time, seconds, last_frame / seconds);
         if (printer_baud) printf("printer FIFO full for %ld clocks\n", printer_held);
+        if (fujinet.enabled()) fujinet.summary();
         top->final();
         return 0;
 }
@@ -1435,10 +1470,12 @@ LoadFDI(&Disks[4],"adam.ddp",FMT_DDP);
                 if (!disk_file[i].empty()) { blockdevice.MountDisk(disk_file[i], i); media = true; }
                 if (!tape_file[i].empty()) { blockdevice.MountDisk(tape_file[i], 4 + i); media = true; }
         }
-        if (!media) {
+        if (!media && !no_media) {
                 blockdevice.MountDisk("adam.dsk",0);
                 blockdevice.MountDisk("adam.ddp",4);
         }
+
+        if (fujinet.enabled()) { fujinet.start(); }
 
         // Cartridge from the command line; index 1 is the core's "Load CART"
         if (!cart_file.empty()) { bus.QueueDownload(cart_file, 1, 1); }
