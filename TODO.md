@@ -38,6 +38,55 @@ multicart reset check in section 8. None of them needs a new build any more - `c
 shipped since `releases/ColecoAdam_20260918.rbf`, and `docs/builds/ColecoAdam_20260922_refresh.rbf`
 carries the expander and the R register on top of it. `HANDOFF.md` is the checklist.
 
+## 0a. FujiNet (branch `fujinet`, 2026-11-07)
+
+The core is the AdamNet master for FujiNet-PC's devices; the simulator boots FujiNet's CONFIG
+(`STATUS.md`, FujiNet section; `CLAUDE.md` for how it fits). Open:
+
+- [x] **Hardware: CONFIG boots on mister192** (2026-11-08, `docs/builds/ColecoAdam_fujinet_20261108b.rbf`,
+  with the daemon from patch 0002 as it now stands), and `weather.ddp` from fujinet.online
+  mounts and boots. Still to do there: print from SmartWRITER (goes to FujiNet's printer) and
+  the local-floppy-wins check. `HANDOFF.md` section 4.
+- [ ] **HTTPS fails in the ARM daemon**: `weather.ddp`'s geotimezone and open-meteo requests get
+  "mgHttpClient: Error - TLS handshake: -0x7780" (a fatal alert from the server) on mister192,
+  while the native Mac build fetches them in the simulator. FujiNet-PC's Mbed TLS cross-build
+  in `FujiNet_MiSTer/docker/` (certificates, TLS versions, the threading options the HOWTO now
+  sets), not the core.
+- [x] **Network open failed in FujiNet-PC** (found with `weather.ddp`; fixed, passed on
+  mister192 2026-11-08): the open spec the ADAM's
+  fujinet-lib sends is `03 4E 3A 48 54 54 50 ...`, a control byte before `N:HTTP://`. Upstream's
+  `util_remove_n_prefix` used to strip blindly up to the first colon and so hid it; since it
+  checks for `N:` at the very start (upstream #1603) the scheme comes out as `N` and the open
+  fails, and the program's next command, set parser (FCh), built a parser on the null protocol
+  and took the daemon down. With the open fixed the daemon still died on that command: the
+  unified `NDevice` reads a command's one parameter from the second slot (SIO's aux2), which an
+  ADAM packet does not have, and the packet class asserts. The pre-unification ADAM code read
+  the first slot. `patches/0003-*` in `FujiNet_MiSTer` drops leading control bytes from the
+  spec, refuses a parser without a protocol, and overrides set parser (FCh) and HTTP channel
+  mode (`M`) in `adamNetwork` to read the first slot. Confirm on hardware, then send upstream.
+  Also seen: the app's app-key read and write report "Invalid app key metadata", so its OPEN
+  APPKEY (DCh) never registers; the location setting will not persist.
+- [x] **The real tty is not the simulator's socket** (found on mister192, 2026-11-08). Two
+  things the socket never showed: FujiNet-PC's serial path waited only 2 ms for the rest of a
+  packet, and a Linux tty delivers bytes in chunks several ms apart, so every 9 byte block
+  request was NAKed (patch 0002 now waits 100 ms). And FujiNet-PC clears its input after each
+  command it answers, so two of our commands landing in one chunk become one: the RECEIVE
+  re-poll (was 5 ms) and the reset broadcast (was 1 ms apart) now wait 50 and 20 ms. With the
+  daemon stopped, `stty -F /dev/ttyS1 115200 raw` and `cat /dev/ttyS1 | xxd` shows what the
+  core sends; `--fujinet-log` is the simulator's equivalent.
+- [x] **Boot wait.** Main sends the UART mode a moment after the core has booted, so the first
+  EOS scan ran with FujiNet off and the ADAM sat in SmartWRITER. Entering or leaving FujiNet
+  mode now resets the ADAM (`ColecoAdam.sv`, like a Mode change). Until that build is on the
+  card, `_AdamTests/F1 FujiNet boot.mgl` loads the core with `<reset delay="10">`.
+- [ ] **Speed.** EOS reads every block twice (`__READ_BLOCK`), so CONFIG's 33 blocks take about
+  6 s at 115,200 baud. A faster UART speed in Main's list, or serving the second read of the
+  same block from the master's buffer, would halve it.
+- [ ] **Character reads longer than the DCB buffer** are truncated to it; the real master's
+  behaviour there is unverified. `MN_READY` is never sent.
+- [ ] **An OSD choice** for which disk slots FujiNet may take, instead of "any slot without an
+  image"; and a FujiNet indicator (`fuji_online` exists in `cv_adamnet`).
+- [ ] Send patch 0002 (serial port and baud from config) upstream to `fujinet-firmware`.
+
 ## 1. Try the September fixes on a MiSTer
 
 - [x] Build with Quartus: done 2026-09-13 with 17.0.2 on the Linux machine. It fits, at 84% of
