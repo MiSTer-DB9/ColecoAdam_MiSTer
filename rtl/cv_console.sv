@@ -65,6 +65,7 @@ module cv_console
    parameter     NUM_DISKS    = 1,
    parameter     NUM_TAPES    = 4,
    parameter     USE_REQ      = 1,
+   parameter     CLK_HZ       = 42_666_000,  // clk_i, for the FujiNet master's timeouts
    parameter     TOT_DISKS    = NUM_DISKS + NUM_TAPES
    )
   (
@@ -138,6 +139,15 @@ module cv_console
    output logic [7:0]           prn_data,
    output logic                 prn_strobe,
    input                        prn_ready,
+   // FujiNet: AdamNet wire bytes to and from cv_fuji_uart at the top level
+   input                        fuji_en,
+   output logic [7:0]           fuji_tx_data,
+   output logic                 fuji_tx_wr,
+   input                        fuji_tx_busy,
+   input [7:0]                  fuji_rx_data,
+   input                        fuji_rx_avail,
+   output logic                 fuji_rx_rd,
+   output logic                 fuji_rx_flush,
 
    // Video RAM Interface ----------------------------------------------------
    output [13:0]                vram_a_o,
@@ -561,7 +571,8 @@ module cv_console
     #
     (.NUM_DISKS (NUM_DISKS),
      .NUM_TAPES (NUM_TAPES),
-     .USE_REQ   (USE_REQ)
+     .USE_REQ   (USE_REQ),
+     .CLK_HZ    (CLK_HZ)
      )
   adamnet
     (
@@ -617,6 +628,15 @@ module cv_console
      .adamnet_wait_n,
      .adamnet_sel,
      .adamnet_dout,
+
+     .fuji_en,
+     .fuji_tx_data,
+     .fuji_tx_wr,
+     .fuji_tx_busy,
+     .fuji_rx_data,
+     .fuji_rx_avail,
+     .fuji_rx_rd,
+     .fuji_rx_flush,
 
      .ps2_key
      );

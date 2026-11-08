@@ -372,14 +372,22 @@ always @(posedge clk_sys) begin
         old_mode <= mode ;
 end
 
-wire reset = RESET | status[0] | buttons[1] | old_mode != mode | ioctl_download;
+// FujiNet (UART connection mode 8, see the UART section below). Main sends the mode a moment
+// after the core has booted, and the ADAM only looks for boot devices at reset, so entering or
+// leaving FujiNet mode resets the ADAM the way a Mode change does: the first boot in FujiNet
+// mode then finds FujiNet's disk 1, and leaving it drops the devices that are no longer there.
+wire fuji_en = (uart_mode == 8'd8) && (uart_speed != 0);
+reg  old_fuji_en = 0;
+always @(posedge clk_sys) old_fuji_en <= fuji_en;
+
+wire reset = RESET | status[0] | buttons[1] | old_mode != mode | ioctl_download | old_fuji_en != fuji_en;
 
 // Loading a cartridge in Computer mode acts as the ADAM's cartridge reset switch: it starts with
 // OS-7, 24K of RAM and the cartridge (ADAM Technical Manual 2.6). Reset returns to SmartWRITER.
 reg game_reset = 0;
 always @(posedge clk_sys) begin
         if (ioctl_download && ioctl_index[5:0] == 1) game_reset <= 1;
-        else if (RESET | status[0] | buttons[1] | old_mode != mode) game_reset <= 0;
+        else if (RESET | status[0] | buttons[1] | old_mode != mode | old_fuji_en != fuji_en) game_reset <= 0;
 end
 
 /////////////////  Memory  ////////////////////////
@@ -664,6 +672,8 @@ wire [7:0] prn_data;
 wire       prn_strobe;
 wire       prn_ready;
 
+wire prn_txd;
+
 cv_printer_uart #(.CLK_HZ(42_666_000)) printer_uart
 (
         .clk(clk_sys),
@@ -673,8 +683,38 @@ cv_printer_uart #(.CLK_HZ(42_666_000)) printer_uart
         .din(prn_data),
         .wr(prn_strobe),
         .ready(prn_ready),
-        .txd(UART_TXD)
+        .txd(prn_txd)
 );
+
+// FujiNet (UART connection mode 8; fuji_en is defined with the reset above). FujiNet-PC runs
+// on the HPS as a set of AdamNet devices on /dev/ttyS1, and cv_adamnet speaks the AdamNet
+// wire protocol to it through this UART at the speed Main reports for the mode. The printer's
+// transmitter and this one share UART_TXD; the mode says which drives it.
+wire [7:0] fuji_tx_data;
+wire       fuji_tx_wr, fuji_tx_busy;
+wire [7:0] fuji_rx_data;
+wire       fuji_rx_avail, fuji_rx_rd, fuji_rx_flush;
+wire       fuji_txd;
+
+cv_fuji_uart #(.CLK_HZ(42_666_000)) fuji_uart
+(
+        .clk(clk_sys),
+        .reset(RESET),
+        .enable(fuji_en),
+        .baud(uart_speed),
+        .tx_data(fuji_tx_data),
+        .tx_wr(fuji_tx_wr),
+        .tx_busy(fuji_tx_busy),
+        .rx_data(fuji_rx_data),
+        .rx_avail(fuji_rx_avail),
+        .rx_rd(fuji_rx_rd),
+        .rx_flush(fuji_rx_flush),
+        .rx_err(),
+        .txd(fuji_txd),
+        .rxd(UART_RXD)
+);
+
+assign UART_TXD = fuji_en ? fuji_txd : prn_txd;
 
 cv_console
     #
@@ -749,6 +789,15 @@ cv_console
         .prn_data(prn_data),
         .prn_strobe(prn_strobe),
         .prn_ready(prn_ready),
+
+        .fuji_en(fuji_en),
+        .fuji_tx_data(fuji_tx_data),
+        .fuji_tx_wr(fuji_tx_wr),
+        .fuji_tx_busy(fuji_tx_busy),
+        .fuji_rx_data(fuji_rx_data),
+        .fuji_rx_avail(fuji_rx_avail),
+        .fuji_rx_rd(fuji_rx_rd),
+        .fuji_rx_flush(fuji_rx_flush),
 
         .vram_a_o(vram_a),
         .vram_we_o(vram_we),

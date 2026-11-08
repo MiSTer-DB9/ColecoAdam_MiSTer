@@ -63,12 +63,15 @@
 //
 //-----------------------------------------------------------------------------
 
+import cv_fuji_pkg::*;
+
 module cv_adamnet
   #
   (
    parameter NUM_DISKS = 1,
    parameter NUM_TAPES = 1,
    parameter USE_REQ = 1,
+   parameter CLK_HZ = 42_666_000,   // for the FujiNet master's timeouts
    parameter TOT_DISKS = NUM_DISKS + NUM_TAPES
    )
   (
@@ -123,7 +126,19 @@ module cv_adamnet
    input logic                  adamnet_ack_n,
    output logic                 adamnet_wait_n,
    output logic                 adamnet_sel,
-   output logic [7:0]           adamnet_dout
+   output logic [7:0]           adamnet_dout,
+
+   // FujiNet. While fuji_en is high the devices FujiNet-PC serves are not
+   // emulated here but reached over the AdamNet wire, byte by byte through
+   // cv_fuji_uart (see cv_adamnet_master and the is_fuji rule below).
+   input logic                  fuji_en,
+   output logic [7:0]           fuji_tx_data,
+   output logic                 fuji_tx_wr,
+   input logic                  fuji_tx_busy,
+   input logic [7:0]            fuji_rx_data,
+   input logic                  fuji_rx_avail,
+   output logic                 fuji_rx_rd,
+   output logic                 fuji_rx_flush
    );
 
   //assign adamnet_dout = ramb_dout;
@@ -292,6 +307,66 @@ module cv_adamnet
   bit [14:0] is_kbd;
   bit [14:0] is_prn;
   bit [14:0] is_tap;
+  bit [14:0] is_fuji;
+
+  //--------------------------------------------------------------------------
+  // FujiNet forwarding
+  //
+  // A DCB whose device FujiNet serves is not emulated here while fuji_en is
+  // high: its command is queued for the AdamNet master, which runs the wire
+  // transaction with FujiNet-PC, and the result lands back in the DCB the way
+  // the master 6801 would write it. FujiNet-PC registers the printer (2), the
+  // clock (3), disks 1-4 (4-7), two network adapters (9, A) and the Fuji
+  // gateway (F) on an ADAM. A disk with an image mounted in the OSD stays
+  // local, so FujiNet gets the empty slots. The keyboard and tapes stay here:
+  // FujiNet has no tape device. (ADAMEm's bridge forwards the same set.)
+  //
+  // The job state machine below copies a write's bytes from ADAM RAM into
+  // the master's buffer first, or a read's bytes out of it afterwards, in a
+  // burst with the Z80 held off its bus, as the disk engine does. The DCB
+  // status stays below 80h meanwhile, and EOS polls, as on an ADAM.
+  //--------------------------------------------------------------------------
+  logic [14:0] fuji_pending;      // DCBs with a command waiting for the wire
+  logic [7:0]  fuji_cmd[15];      // and what it was
+
+  // job state machine -> the DCB block
+  logic        fj_clear;          // drop fuji_pending[fj_dev]
+  logic        fj_finish;         // write the result into DCB fj_dev
+  logic [3:0]  fj_dev;            // the DCB being served
+  logic [7:0]  fj_result;
+  logic        fj_set_status;     // a STATUS answered: block size, type, node type
+  logic [15:0] fj_maxl;
+  logic [7:0]  fj_devtype;
+  logic [7:0]  fj_node;
+  logic        fj_set_len;        // a character read: how many bytes arrived
+  logic [15:0] fj_len;
+
+  // job state machine -> the RAM port
+  logic        fj_bus_req;        // hold the Z80 off its bus
+  logic        fj_ram_active;     // and drive the RAM port
+  logic [15:0] fj_ram_addr;
+  logic        fj_ram_wr;
+  logic        fj_ram_rd;
+  logic [7:0]  fj_wdata;
+  logic        fuji_sel;
+
+  // the master
+  logic        fm_req;
+  logic [2:0]  fm_op;
+  logic [3:0]  fm_dev;
+  logic [31:0] fm_block;
+  logic [15:0] fm_len;
+  logic        fm_patient;
+  logic        fm_busy;
+  logic        fm_done;
+  logic [7:0]  fm_result;
+  logic [15:0] fm_rsp_len;
+  logic [7:0]  fm_rsp_devtype;
+  logic [7:0]  fm_rsp_status;
+  logic [9:0]  fm_buf_addr;
+  logic        fm_buf_wr;
+  logic [7:0]  fm_buf_din;
+  logic [7:0]  fm_buf_q;
 
   always_ff @(posedge clk_i) begin
     dcb_cmd_hit     <= '0;
@@ -303,6 +378,7 @@ module cv_adamnet
     is_kbd          <= '0;
     is_prn          <= '0;
     is_tap          <= '0;
+    is_fuji         <= '0;
     diskid          <= '0;
     tapeid          <= '0;
 
@@ -333,6 +409,15 @@ module cv_adamnet
                     ({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h9) |
                     ({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h18) |
                     ({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h19) & (i < max_dcb);
+        // FujiNet's devices: 2, 3, 9, A, F, and a disk 4-7 with no image mounted here
+        is_fuji[i] <= fuji_en & (i < max_dcb) &
+                      (({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h02) |
+                       ({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h03) |
+                       ({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h09) |
+                       ({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h0A) |
+                       ({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:0]} == 8'h0F) |
+                       (({dcb_table[i].dcb_dev_num[3:0], dcb_table[i].dcb_add_code[3:2]} == 6'b000001) &
+                        ~disk_present[dcb_table[i].dcb_add_code[1:0]]));
       //end // if (i < pcb_table.pcb_max_dcb)
     end
   end
@@ -442,7 +527,22 @@ module cv_adamnet
                 if (z80_wr && (z80_data_wr == 8'h00 || z80_data_wr[7]))
                   dcb_table[dcb_dev].dcb_cmd_stat <= z80_data_wr;
                 if (|z80_data_wr[6:0] && ~z80_data_wr[7]) begin
-                  if (is_kbd[dcb_dev]) begin
+                  if (is_fuji[dcb_dev]) begin
+                    // FujiNet's device: queue the command for the wire and leave the
+                    // DCB busy. The job state machine finishes it.
+                    if (z80_wr) begin
+                      case (z80_data_wr)
+                        CMD_STATUS, CMD_SOFT_RESET, CMD_WRITE, CMD_READ: begin
+                          dcb_table[dcb_dev].dcb_cmd_stat <= '0;
+                          fuji_pending[dcb_dev]           <= '1;
+                          fuji_cmd[dcb_dev]               <= z80_data_wr;
+                        end
+                        default: begin
+                          dcb_table[dcb_dev].dcb_cmd_stat <= RSP_STATUS;
+                        end
+                      endcase
+                    end
+                  end else if (is_kbd[dcb_dev]) begin
 `ifdef ADAMNET_TRACE
                     if (z80_wr) $display("Adamnet trace: KBD dcb %0d cmd %02x buf %02x%02x len %02x%02x",
                                          dcb_dev, z80_data_wr,
@@ -712,6 +812,30 @@ module cv_adamnet
       disk_lastblock[done_dev] <= sec;
     end
 
+    // A FujiNet job finished: the result into its DCB, as the master 6801 writes it.
+    // A STATUS also brings the device's block size, type and node type (the
+    // status byte of the wire packet, whose low nibble EOS reads as the media
+    // state); a character read reports how many bytes actually came.
+    if (fj_clear) fuji_pending[fj_dev] <= '0;
+    if (fj_finish) begin
+      dcb_table[fj_dev].dcb_cmd_stat <= fj_result;
+      if (fj_set_status) begin
+        dcb_table[fj_dev].dcb_maxl_lo   <= fj_maxl[7:0];
+        dcb_table[fj_dev].dcb_maxl_hi   <= fj_maxl[15:8];
+        dcb_table[fj_dev].dcb_dev_type  <= fj_devtype;
+        // The whole status byte, as the master 6801 writes it: EOS reads the
+        // low nibble as the media state (0 ok, 3 no media...; the high nibble
+        // is the second tape's, eos52.asm A61989), and FujiNet's network devices
+        // report their connection state in the high bits (programming guide,
+        // "Network Device Status Codes").
+        dcb_table[fj_dev].dcb_node_type <= fj_node;
+      end
+      if (fj_set_len) begin
+        dcb_table[fj_dev].dcb_buf_len_lo <= fj_len[7:0];
+        dcb_table[fj_dev].dcb_buf_len_hi <= fj_len[15:8];
+      end
+    end
+
     if (~adam_reset_pcb_n_i) begin
       // On reset setup PCB table
       pcb_addr       <= PCB_BASE_INIT;
@@ -720,6 +844,7 @@ module cv_adamnet
       adamnet_wait_n <= '1;
       kbd_status     <= RSP_STATUS;
       prn_busy       <= '0;
+      fuji_pending   <= '0;
     end
   end
 
@@ -785,7 +910,7 @@ module cv_adamnet
   logic [7:0]  kbd_data;
 
   //assign ramb_dout    = clear_strobe ? code : disk_data;
-  assign ramb_dout    = kbd_sel ? kbd_data : disk_data[disk_dev];
+  assign ramb_dout    = fuji_sel ? fj_wdata : kbd_sel ? kbd_data : disk_data[disk_dev];
 
   typedef enum bit [3:0]
                {
@@ -868,8 +993,8 @@ module cv_adamnet
     prn_state  = PRN_IDLE;
   end
 
-  assign watch_key = (kbd_state == KBD_KEY) && (disk_state == DISK_IDLE) && !kbd_empty;
-  assign prn_port_free = (disk_state == DISK_IDLE) && !disk_req && !tape_req && !watch_key;
+  assign watch_key = (kbd_state == KBD_KEY) && (disk_state == DISK_IDLE) && !kbd_empty && !fj_ram_active;
+  assign prn_port_free = (disk_state == DISK_IDLE) && !disk_req && !tape_req && !watch_key && !fj_ram_active;
 
   assign disk_sector = disk_active ? {disk_sec[31:3], InterleaveTable(disk_sec[2:0])} : disk_sec;
 
@@ -890,6 +1015,7 @@ module cv_adamnet
     prn_strobe       <= '0;
     prn_done         <= '0;
     kbd_sel          <= watch_key;
+    fuji_sel         <= fj_ram_active;
     adamnet_req_n    <= '1;
     set_lastblock    <= '0;
 
@@ -1084,6 +1210,16 @@ module cv_adamnet
       endcase
     end
 
+    // FujiNet copy: last, so it overrides the idle default while it holds the port.
+    // It only starts while the disk, keyboard and printer engines are idle, and
+    // they stay idle while fj_ram_active is high (watch_key, prn_port_free).
+    if (fj_ram_active) begin
+      ramb_addr <= fj_ram_addr;
+      ramb_wr   <= fj_ram_wr;
+      ramb_rd   <= fj_ram_rd;
+    end
+    if (fj_bus_req) adamnet_req_n <= '0;
+
     lastpress <= ps2_key[10];
     if(lastpress != ps2_key[10]) begin
       if      (ps2_key[8:0] == 9'h014) ctrl  <= ps2_key[9]; //CTRL
@@ -1187,6 +1323,297 @@ module cv_adamnet
       end
     endcase // case (kbd_state)
 
+  end
+
+  //--------------------------------------------------------------------------
+  // FujiNet: the wire master, and the job state machine that feeds it
+  //--------------------------------------------------------------------------
+  cv_adamnet_master #(.CLK_HZ(CLK_HZ)) fuji_master
+    (
+     .clk(clk_i),
+     .reset(~adam_reset_pcb_n_i),
+     .enable(fuji_en),
+     .req(fm_req),
+     .req_op(fm_op),
+     .req_dev(fm_dev),
+     .req_block(fm_block),
+     .req_len(fm_len),
+     .req_patient(fm_patient),
+     .busy(fm_busy),
+     .done(fm_done),
+     .result(fm_result),
+     .rsp_len(fm_rsp_len),
+     .rsp_devtype(fm_rsp_devtype),
+     .rsp_status(fm_rsp_status),
+     .buf_addr(fm_buf_addr),
+     .buf_wr(fm_buf_wr),
+     .buf_din(fm_buf_din),
+     .buf_q(fm_buf_q),
+     .tx_data(fuji_tx_data),
+     .tx_wr(fuji_tx_wr),
+     .tx_busy(fuji_tx_busy),
+     .rx_data(fuji_rx_data),
+     .rx_avail(fuji_rx_avail),
+     .rx_rd(fuji_rx_rd),
+     .rx_flush(fuji_rx_flush)
+     );
+
+  typedef enum logic [3:0] {
+    FJ_IDLE, FJ_AUX, FJ_PICK, FJ_DISPATCH, FJ_FETCH_REQ, FJ_FETCH,
+    FJ_START, FJ_WAIT, FJ_STORE_REQ, FJ_STORE, FJ_FINISH
+  } fj_state_t;
+
+  fj_state_t   fj_state;
+  logic        fj_reset_pend;    // after a reset: MN_RESET to FujiNet's devices...
+  logic        fj_probe_pend;    // ...then a patient STATUS to the gateway, so a daemon
+                                 // still starting is there before EOS scans for devices
+  logic        fuji_online;      // the last probe was answered
+  logic [7:0]  fj_cmd;
+  logic [7:0]  fj_devid;
+  logic [15:0] fj_buf;
+  logic [15:0] fj_dlen;
+  logic [31:0] fj_blk;
+  logic        fj_isblk;
+  logic [15:0] fj_n;             // bytes to copy
+  logic [15:0] fj_i;
+  logic [2:0]  fj_phase;
+  logic        engines_idle;
+  logic [15:0] fj_n_calc;
+
+  assign engines_idle = (disk_state == DISK_IDLE) && !disk_req && !tape_req &&
+                        !watch_key && (prn_state == PRN_IDLE);
+  // The DCB block clears fuji_pending a clock after fj_clear, so the job just
+  // finished still shows as pending in the clock FJ_IDLE looks: mask it out, or
+  // every command would run twice.
+  logic [14:0] fuji_waiting;
+  always_comb begin
+    fuji_waiting = fuji_pending;
+    if (fj_clear) fuji_waiting[fj_dev] = 1'b0;
+  end
+  // a block device always moves 1024 bytes; a character device what the DCB says, capped
+  assign fj_n_calc = fj_isblk ? 16'd1024 : (fj_dlen > 16'd1024) ? 16'd1024 : fj_dlen;
+
+  always_ff @(posedge clk_i) begin
+    fm_req     <= '0;
+    fm_buf_wr  <= '0;
+    fj_ram_wr  <= '0;
+    fj_ram_rd  <= '0;
+    fj_clear   <= '0;
+    fj_finish  <= '0;
+
+    case (fj_state)
+      FJ_IDLE: begin
+        fj_ram_active <= '0;
+        fj_bus_req    <= '0;
+        if (!fuji_en) begin
+          fj_reset_pend <= '0;
+          fj_probe_pend <= '0;
+          fuji_online   <= '0;
+        end
+        if (fuji_en && fj_reset_pend) begin
+          fm_op         <= FOP_RESET_ALL;
+          fm_dev        <= 4'hF;
+          fm_patient    <= '0;
+          fm_req        <= '1;
+          fj_reset_pend <= '0;
+          fj_state      <= FJ_AUX;
+        end else if (fuji_en && fj_probe_pend) begin
+          fm_op         <= FOP_STATUS;
+          fm_dev        <= 4'hF;
+          fm_patient    <= '1;
+          fm_req        <= '1;
+          fj_probe_pend <= '0;
+          fj_state      <= FJ_AUX;
+        end else if (|fuji_waiting) begin
+          // the lowest numbered DCB waiting (the loop's last assignment wins)
+          for (int i = 14; i >= 0; i--) if (fuji_waiting[i]) fj_dev <= i;
+          fj_state <= FJ_PICK;
+        end
+      end
+
+      // a reset broadcast or the probe: nothing to write back
+      FJ_AUX: begin
+        if (fm_done) begin
+          if (fm_op == FOP_STATUS) begin
+            fuji_online <= (fm_result == FRES_OK);
+            $display("Adamnet (HDL): FujiNet gateway %s", fm_result == FRES_OK ? "answered" : "did not answer");
+          end
+          fj_state <= FJ_IDLE;
+        end
+      end
+
+      FJ_PICK: begin
+`ifdef ADAMNET_TRACE
+        $display("Adamnet trace: FujiNet pick dcb %0d, pending %015b", fj_dev, fuji_pending);
+`endif
+        fj_cmd   <= fuji_cmd[fj_dev];
+        fj_devid <= {dcb_table[fj_dev].dcb_dev_num[3:0], dcb_table[fj_dev].dcb_add_code[3:0]};
+        fj_buf   <= {dcb_table[fj_dev].dcb_ba_hi, dcb_table[fj_dev].dcb_ba_lo};
+        fj_dlen  <= {dcb_table[fj_dev].dcb_buf_len_hi, dcb_table[fj_dev].dcb_buf_len_lo};
+        fj_blk   <= {dcb_table[fj_dev].dcb_sec_num_3, dcb_table[fj_dev].dcb_sec_num_2,
+                     dcb_table[fj_dev].dcb_sec_num_1, dcb_table[fj_dev].dcb_sec_num_0};
+        fj_isblk <= ({dcb_table[fj_dev].dcb_dev_num[3:0], dcb_table[fj_dev].dcb_add_code[3:2]} == 6'b000001);
+        fj_state <= FJ_DISPATCH;
+      end
+
+      FJ_DISPATCH: begin
+        $display("Adamnet (HDL): FujiNet dev %02x cmd %02x buf %04x len %04x block %0d",
+                 fj_devid, fj_cmd, fj_buf, fj_dlen, fj_blk);
+        fj_n      <= fj_n_calc;
+        fj_result <= FRES_OK;
+        fj_i      <= '0;
+        fj_phase  <= '0;
+        if (!fuji_en) begin
+          // the link went away with this queued
+          fj_result <= FRES_TIMEOUT;
+          fj_state  <= FJ_FINISH;
+        end else begin
+          case (fj_cmd)
+            CMD_STATUS: begin
+              fm_op    <= FOP_STATUS;
+              fj_state <= FJ_START;
+            end
+            CMD_SOFT_RESET: begin
+              fm_op    <= FOP_RESET;
+              fj_state <= FJ_START;
+            end
+            CMD_WRITE: begin
+              fm_op    <= fj_isblk ? FOP_WRITE_BLOCK : FOP_CHAR_WRITE;
+              fj_state <= (fj_n_calc == 0) ? FJ_START : FJ_FETCH_REQ;
+            end
+            CMD_READ: begin
+              fm_op    <= fj_isblk ? FOP_READ_BLOCK : FOP_CHAR_READ;
+              fj_state <= FJ_START;
+            end
+            default: fj_state <= FJ_FINISH;
+          endcase
+        end
+      end
+
+      // Take the bus, once the other engines are quiet, for a copy
+      FJ_FETCH_REQ, FJ_STORE_REQ: begin
+        fj_bus_req <= '1;
+        if ((~adamnet_ack_n || USE_REQ == 0) && engines_idle) begin
+          fj_ram_active <= '1;
+          fj_i          <= '0;
+          fj_phase      <= '0;
+          fj_state      <= (fj_state == FJ_FETCH_REQ) ? FJ_FETCH : FJ_STORE;
+        end
+      end
+
+      // ADAM RAM -> the master's buffer, one byte per 6 clocks. The address is
+      // registered on its way out of this module and the RAM's read port is
+      // registered too, so ramb_din holds the byte three clocks after the address.
+      FJ_FETCH: begin
+        fj_phase <= fj_phase + 1'b1;
+        case (fj_phase)
+          3'd0: begin
+            fj_ram_addr <= fj_buf + fj_i;
+            fj_ram_rd   <= '1;
+          end
+          3'd4: begin
+            fm_buf_addr <= fj_i[9:0];
+            fm_buf_din  <= ramb_din;
+            fm_buf_wr   <= '1;
+          end
+          3'd5: begin
+            fj_phase <= '0;
+            fj_i     <= fj_i + 1'b1;
+            if (fj_i + 1'b1 == fj_n) begin
+              fj_ram_active <= '0;
+              fj_bus_req    <= '0;
+              fj_state      <= FJ_START;
+            end
+          end
+          default: begin
+          end
+        endcase
+      end
+
+      FJ_START: begin
+        fm_dev     <= fj_devid[3:0];
+        fm_block   <= fj_blk;
+        fm_len     <= fj_n;         // bytes to send, or room for a reply
+        fm_patient <= '0;
+        fm_req     <= '1;
+        fj_state   <= FJ_WAIT;
+      end
+
+      FJ_WAIT: begin
+        if (fm_done) begin
+          fj_result <= fm_result;
+          if (fj_cmd == CMD_READ) begin
+            if (fm_result == FRES_OK && fm_rsp_len != 0) begin
+              fj_n     <= (fm_rsp_len > fj_n) ? fj_n : fm_rsp_len;
+              fj_state <= FJ_STORE_REQ;
+            end else begin
+              fj_n     <= '0;
+              fj_state <= FJ_FINISH;
+            end
+          end else begin
+            fj_state <= FJ_FINISH;
+          end
+        end
+      end
+
+      // The master's buffer -> ADAM RAM, one byte per 8 clocks. The buffer reads
+      // back a clock after its address; the write strobe and data go out through
+      // the registered port two clocks later and must sit still around it.
+      FJ_STORE: begin
+        fj_phase <= fj_phase + 1'b1;
+        case (fj_phase)
+          3'd0: fm_buf_addr <= fj_i[9:0];
+          3'd2: begin
+            fj_wdata    <= fm_buf_q;
+            fj_ram_addr <= fj_buf + fj_i;
+          end
+          3'd4: fj_ram_wr <= '1;
+          3'd7: begin
+            fj_i <= fj_i + 1'b1;
+            if (fj_i + 1'b1 == fj_n) begin
+              fj_ram_active <= '0;
+              fj_bus_req    <= '0;
+              fj_state      <= FJ_FINISH;
+            end
+          end
+          default: begin
+          end
+        endcase
+      end
+
+      FJ_FINISH: begin
+        fj_finish     <= '1;
+        fj_clear      <= '1;
+        fj_set_status <= (fj_cmd == CMD_STATUS) && (fj_result == FRES_OK);
+        fj_maxl       <= fm_rsp_len;
+        fj_devtype    <= fm_rsp_devtype;
+        fj_node       <= fm_rsp_status;
+        fj_set_len    <= (fj_cmd == CMD_READ) && !fj_isblk && (fj_result == FRES_OK);
+        fj_len        <= fj_n;
+        $display("Adamnet (HDL): FujiNet dev %02x cmd %02x -> %02x, %0d bytes", fj_devid, fj_cmd, fj_result, fj_n);
+        fj_state      <= FJ_IDLE;
+      end
+
+      default: fj_state <= FJ_IDLE;
+    endcase
+
+    if (~adam_reset_pcb_n_i) begin
+      fj_state      <= FJ_IDLE;
+      fj_ram_active <= '0;
+      fj_bus_req    <= '0;
+      fj_reset_pend <= '1;
+      fj_probe_pend <= '1;
+    end
+  end
+
+  initial begin
+    fj_state      = FJ_IDLE;
+    fj_ram_active = '0;
+    fj_bus_req    = '0;
+    fj_reset_pend = '0;
+    fj_probe_pend = '0;
+    fuji_online   = '0;
+    fuji_pending  = '0;
   end
 
 always @(*) begin
