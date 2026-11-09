@@ -20,6 +20,12 @@ static double now_seconds() {
 }
 
 void FujiNetLink::start() {
+	if (fake.on) {
+		printf("FujiNet: the stand-in serves disk 1 (block latency %.0f ms%s); UART at %d baud\n",
+		       fake.latency_ms, fake.drop_clr ? ", some CLRs dropped" : "", baud);
+		fflush(stdout);
+		return;
+	}
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (listen_fd < 0) { perror("fujinet: socket"); exit(1); }
 	int on = 1;
@@ -62,7 +68,7 @@ void FujiNetLink::disconnect(const char* why) {
 }
 
 bool FujiNetLink::holding_reset() {
-	if (!enabled() || !wait_for_peer || gave_up) return false;
+	if (!enabled() || fake.on || !wait_for_peer || gave_up) return false;
 	// accept() is a syscall; the main loop calls this every half clock
 	if (++accept_poll < 2048) return conn_fd < 0;
 	accept_poll = 0;
@@ -89,6 +95,7 @@ void FujiNetLink::send_byte(uint8_t b, int frame) {
 	tx_count++;
 	tx_line.push_back(b);
 	if (log) fprintf(log, "%6d TX %02X\n", frame, b);
+	if (fake.on) { fake.byte_in(b, clock); return; }
 	if (conn_fd < 0) return;
 	ssize_t w = send(conn_fd, &b, 1, 0);
 	if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) disconnect(strerror(errno));
@@ -116,7 +123,8 @@ void FujiNetLink::step(int txd, int frame) {
 	}
 
 	// ---- RX: drive the pin from the socket, 8N1 at the same rate ----
-	if (++recv_poll >= 4096) { recv_poll = 0; poll_socket(); }
+	if (fake.on) fake.pull(clock, rxq);
+	else if (++recv_poll >= 4096) { recv_poll = 0; poll_socket(); }
 	if (rx_bits_left == 0 && !rxq.empty() && clock >= rx_next) {
 		uint8_t b = rxq.front();
 		rxq.pop_front();
@@ -159,5 +167,5 @@ void FujiNetLink::end_frame(int frame) {
 
 void FujiNetLink::summary() {
 	printf("fujinet: %ld bytes to FujiNet-PC, %ld from it, %ld framing errors, %s\n",
-	       tx_count, rx_count, tx_framing_errors, conn_fd >= 0 ? "connected" : "not connected");
+	       tx_count, rx_count, tx_framing_errors, fake.on ? "stand-in" : conn_fd >= 0 ? "connected" : "not connected");
 }

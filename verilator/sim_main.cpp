@@ -48,6 +48,8 @@ struct PrinterRx {
 static PrinterRx printer_rx;
 static long printer_held = 0;           // clocks the full FIFO held the ADAM off
 static bool no_media = false;           // --no-media: don't mount adam.dsk/adam.ddp by default
+static int fuji_config_frame = -1;      // --fujinet-config FRAME: the OSD's "FujiNet: boot CONFIG"
+static long fuji_config_clocks = 0;     // half clocks left of the reset it gives
 #else
 #define VERTOPINTERN top
 #endif
@@ -402,7 +404,9 @@ int verilate() {
                 // --spin drives the spinner device path, like the OSD's "Spinner" setting
                 VERTOPINTERN->spin_mode = spin_mode_opt;
                 VERTOPINTERN->prn_baud = printer_baud;
-                VERTOPINTERN->fuji_baud = fujinet.enabled() ? fujinet.baud : 0;
+                VERTOPINTERN->fuji_baud = fujinet.enabled() && fujinet.mode_reported() ? fujinet.baud : 0;
+                VERTOPINTERN->fuji_boot_hold_en = fujinet.enable_at_ms > 0;
+                if (fuji_config_clocks > 0 && --fuji_config_clocks == 0) { VERTOPINTERN->fuji_boot_cfg_req = 0; VERTOPINTERN->reset = 0; }
 
                 // Simulate both edges of system clock
                 if (clk_sys.clk != clk_sys.old) {
@@ -1068,6 +1072,9 @@ void stepSim() {
         if (video.count_frame == last_frame) { return; }
         last_frame = video.count_frame;
         if (fujinet.enabled()) { fujinet.end_frame(last_frame); }
+        // --fujinet-config: as the OSD item does, request CONFIG and reset the ADAM for a frame
+        // (released by clock count in the main loop: no frames are made while the core is in reset)
+        if (last_frame == fuji_config_frame) { VERTOPINTERN->fuji_boot_cfg_req = 1; VERTOPINTERN->reset = 1; fuji_config_clocks = 100000; }
 
         if (headless) {
                 uint32_t rp1 = 0, rp2 = 0;
@@ -1130,6 +1137,12 @@ void usage(const char* prog) {
                 "  --fujinet-log FILE    log every byte each way, with the frame number\n"
                 "  --fujinet-verbose     hexdump each frame's traffic on stdout\n"
                 "  --fujinet-nowait      don't hold reset for FujiNet-PC\n"
+                "  --fujinet-config F    at frame F, do what the OSD's \"FujiNet: boot CONFIG\" does\n"
+                "  --fuji-disk FILE      no FujiNet-PC: a stand-in serves FILE as FujiNet's disk 1 (sim_fuji.h)\n"
+                "  --fuji-latency MS     the stand-in's time to fetch a block (default 300)\n"
+                "  --fuji-drop-clr N     the stand-in ignores every Nth CLR, as one lost on the line\n"
+                "  --fuji-enable-at MS   report FujiNet mode only from MS on, as Main does after a load,\n"
+                "                        with ColecoAdam.sv's reset hold until then\n"
                 "  --no-media            don't mount adam.dsk/adam.ddp from the current directory\n"
                 "  --capture-dir DIR     where F5/F6/F7 write captures (default ./captures)\n"
                 "                        F5 start capturing, F6 stop, F7 grab this frame;\n"
@@ -1197,6 +1210,14 @@ void parseArgs(int argc, char** argv) {
                 }
                 else if (arg == "--fujinet-verbose") { fujinet.verbose = true; }
                 else if (arg == "--fujinet-nowait") { fujinet.wait_for_peer = false; }
+                else if (arg == "--fuji-disk") {
+                        std::string path = value();
+                        if (!fujinet.fake.load(path)) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+                }
+                else if (arg == "--fuji-latency") { fujinet.fake.latency_ms = atof(value().c_str()); }
+                else if (arg == "--fuji-drop-clr") { fujinet.fake.drop_clr = atoi(value().c_str()); }
+                else if (arg == "--fuji-enable-at") { fujinet.enable_at_ms = atof(value().c_str()); }
+                else if (arg == "--fujinet-config") { fuji_config_frame = atoi(value().c_str()); }
                 else if (arg == "--no-media") { no_media = true; }
                 else if (arg == "--printer") {
                         std::string path = value();

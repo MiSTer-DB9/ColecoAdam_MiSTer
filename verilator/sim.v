@@ -97,6 +97,8 @@ module emu
    input [31:0]          fuji_baud,
    output                FUJI_TXD,
    input                 FUJI_RXD,
+   input                 fuji_boot_cfg_req,  // --fujinet-config: the OSD's "FujiNet: boot CONFIG"
+   input                 fuji_boot_hold_en,  // --fuji-enable-at: model ColecoAdam.sv's hold for Main's UART mode
 
    input                 ioctl_download,
    input                 ioctl_wr,
@@ -530,6 +532,31 @@ wire  [7:0] ext_rom_d=8'hff;
 
   // FujiNet link, as in ColecoAdam.sv but at the sim's clock rate
   wire       fuji_en = (fuji_baud != 0);
+  wire       fuji_boot_cfg_ack;
+  reg        fuji_boot_cfg = 0;
+  always @(posedge clk_sys) begin
+     if (fuji_boot_cfg_req && fuji_en) fuji_boot_cfg <= 1;
+     else if (fuji_boot_cfg_ack || !fuji_en) fuji_boot_cfg <= 0;
+  end
+  // Entering or leaving FujiNet mode resets the ADAM for 64K clocks, and after a load the ADAM is
+  // held in reset until the UART mode arrives (1.5 s at most), as in ColecoAdam.sv. The hold is
+  // only modelled when --fuji-enable-at asks for it, so other runs start as they always have.
+  reg old_fuji_en = 0;
+  always @(posedge clk_sys) old_fuji_en <= fuji_en;
+  reg [15:0] fuji_rst_cnt = 0;
+  always @(posedge clk_sys) begin
+     if (old_fuji_en != fuji_en) fuji_rst_cnt <= 16'hFFFF;
+     else if (fuji_rst_cnt != 0) fuji_rst_cnt <= fuji_rst_cnt - 1'd1;
+  end
+  reg        boot_hold_done = 0;
+  reg [24:0] boot_hold = 0;
+  always @(posedge clk_sys) begin
+     if (!boot_hold_done) begin boot_hold_done <= 1; boot_hold <= fuji_boot_hold_en ? 25'd16_000_000 : 25'd0; end
+     else if (fuji_en) boot_hold <= 0;
+     else if (boot_hold != 0) boot_hold <= boot_hold - 1'd1;
+  end
+  wire console_reset = reset | (old_fuji_en != fuji_en) | (fuji_rst_cnt != 0) | (boot_hold != 0);
+
   wire [7:0] fuji_tx_data;
   wire       fuji_tx_wr, fuji_tx_busy;
   wire [7:0] fuji_rx_data;
@@ -564,7 +591,7 @@ wire  [7:0] ext_rom_d=8'hff;
     (
      .clk_i(clk_sys),
      .clk_en_10m7_i(ce_10m7),
-     .reset_n_i(~reset),
+     .reset_n_i(~console_reset),
      .por_n_o(),
      //.sg1000(sg1000),
      //.dahjeeA_i(extram),
@@ -632,6 +659,8 @@ wire  [7:0] ext_rom_d=8'hff;
      .prn_ready(prn_ready),
 
      .fuji_en(fuji_en),
+     .fuji_boot_cfg(fuji_boot_cfg),
+     .fuji_boot_cfg_ack(fuji_boot_cfg_ack),
      .fuji_tx_data(fuji_tx_data),
      .fuji_tx_wr(fuji_tx_wr),
      .fuji_tx_busy(fuji_tx_busy),

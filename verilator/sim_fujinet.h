@@ -22,6 +22,8 @@
 #include <deque>
 #include <vector>
 
+#include "sim_fuji.h"
+
 struct FujiNetLink {
 	// --- options ---------------------------------------------------------
 	int   port          = 0;        // 0 = FujiNet off
@@ -31,7 +33,11 @@ struct FujiNetLink {
 	FILE* log           = nullptr;  // --fujinet-log: one line per byte
 	bool  verbose       = false;    // hexdump each frame's traffic on stdout
 
-	bool enabled() const { return port != 0; }
+	FakeFuji fake;                  // --fuji-disk: the stand-in instead of the socket
+	double enable_at_ms = 0;        // --fuji-enable-at: Main reports the UART mode this late
+
+	bool enabled() const { return port != 0 || fake.on; }
+	bool mode_reported() const { return clock * 1000.0 / CLK_HZ >= enable_at_ms; }
 
 	void    start();                      // listen
 	bool    holding_reset();              // true while the core should stay in reset
