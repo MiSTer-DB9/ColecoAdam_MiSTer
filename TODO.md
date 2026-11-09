@@ -47,11 +47,14 @@ The core is the AdamNet master for FujiNet-PC's devices; the simulator boots Fuj
   with the daemon from patch 0002 as it now stands), and `weather.ddp` from fujinet.online
   mounts and boots. Still to do there: print from SmartWRITER (goes to FujiNet's printer) and
   the local-floppy-wins check. `HANDOFF.md` section 4.
-- [ ] **HTTPS fails in the ARM daemon**: `weather.ddp`'s geotimezone and open-meteo requests get
-  "mgHttpClient: Error - TLS handshake: -0x7780" (a fatal alert from the server) on mister192,
-  while the native Mac build fetches them in the simulator. FujiNet-PC's Mbed TLS cross-build
-  in `FujiNet_MiSTer/docker/` (certificates, TLS versions, the threading options the HOWTO now
-  sets), not the core.
+- [x] **weather.ddp showed no forecast, then a wrong one.** Two more firmware regressions from
+  upstream's unified network device, fixed in patch 0003: JSON query values came back with a
+  `\n` the old ADAM code never added, which the app pasted into its forecast URL; and an open
+  spec was cut at 256 bytes, where the app's forecast URL is 513, so its units, daily and
+  timezone fields were dropped (Celsius labelled °F, 1 Jan 1970). On mister192 2026-11-08 it
+  now shows 50.7°F for San Francisco, matching open-meteo. HTTPS itself works.
+- [ ] **api.geotimezone.com refuses every TLS client** ("unrecognized name", `curl` on a Mac
+  too), so weather.ddp falls back to EST. The app's dependency, not ours.
 - [x] **Network open failed in FujiNet-PC** (found with `weather.ddp`; fixed, passed on
   mister192 2026-11-08): the open spec the ADAM's
   fujinet-lib sends is `03 4E 3A 48 54 54 50 ...`, a control byte before `N:HTTP://`. Upstream's
@@ -78,11 +81,37 @@ The core is the AdamNet master for FujiNet-PC's devices; the simulator boots Fuj
   EOS scan ran with FujiNet off and the ADAM sat in SmartWRITER. Entering or leaving FujiNet
   mode now resets the ADAM (`ColecoAdam.sv`, like a Mode change). Until that build is on the
   card, `_AdamTests/F1 FujiNet boot.mgl` loads the core with `<reset delay="10">`.
-- [ ] **Speed.** EOS reads every block twice (`__READ_BLOCK`), so CONFIG's 33 blocks take about
-  6 s at 115,200 baud. A faster UART speed in Main's list, or serving the second read of the
-  same block from the master's buffer, would halve it.
+- [x] **ADAM CP/M 2.2 from a FujiNet disk stopped after its boot loader** (fixed 2026-11-09 from
+  a tester's patches against the 20261108 package, checked on their board; here in the
+  simulator against FujiNet-PC and against the new stand-in). Three faults:
+  - A FujiNet disk completed every READ, where the local disks answer a block they were not just
+    asked for with 9Bh (busy) first, as ColEm does. CP/M's loader fires a read-ahead of block 7
+    into EE3Bh, inside the BIOS it has just loaded; completing it overwrote the BIOS.
+    `cv_adamnet` now does the same busy-first for FujiNet disks, which also halves CONFIG's
+    wire traffic (34 block fetches instead of 67).
+  - An unanswered CLR failed the read after 8 s with 8Dh, and the BIOS never gets past an error
+    in a DCB. `cv_adamnet_master` drains the line until it is quiet 5 ms before CLR, and re-polls
+    RECEIVE after 500 ms instead of failing.
+  - Loaded from the menu with FujiNet on, the ADAM sometimes came up black: Main sends mode 0,
+    runs `uartmode 0`, then the saved mode 8, and the reset that caused landed 20-75 ms into
+    EOS's start. `ColecoAdam.sv` now holds the ADAM in reset after a load until a UART mode
+    arrives (1.5 s at most, which every load in mode None now waits), and the FujiNet on/off
+    reset lasts 1.5 ms instead of one clock.
+  Also from them: `/sbin/uartmode`'s FujiNet loop has its own token, so a core reload leaves one
+  daemon, not two; and a FujiNet-PC stand-in for the simulator (`--fuji-disk`,
+  `--fuji-latency`, `--fuji-drop-clr`, `--fuji-enable-at`; `verilator/sim_fuji.h`), merged
+  into the pin-level link here.
+- [ ] **Speed.** EOS reads every block twice (`__READ_BLOCK`); since the busy-first change only
+  the second read goes over the wire, so CONFIG's 33 blocks are 33 fetches. A faster UART
+  speed in Main's list would cut it further.
 - [ ] **Character reads longer than the DCB buffer** are truncated to it; the real master's
   behaviour there is unverified. `MN_READY` is never sent.
+- [x] **OSD "FujiNet: boot CONFIG"** (status[20]): sends the Fuji device SET_BOOT_MODE 0 (D6h),
+  which puts the daemon's CONFIG disk back in slot 1, and resets the ADAM. Without it the daemon
+  keeps whatever CONFIG last mounted until it restarts. Passed on mister192 2026-11-08 with
+  `docs/builds/ColecoAdam_fujinet_20261108d.rbf`, from weather.ddp back to CONFIG. The request
+  goes out before the reset broadcast rather than after the probe, since `fuji_online` survives
+  the reset; harmless, as MN_RESET does not unmount. Simulator: `--fujinet-config FRAME`.
 - [ ] **An OSD choice** for which disk slots FujiNet may take, instead of "any slot without an
   image"; and a FujiNet indicator (`fuji_online` exists in `cv_adamnet`).
 - [ ] Send patch 0002 (serial port and baud from config) upstream to `fujinet-firmware`.

@@ -421,9 +421,20 @@ was ruled out correctly; the missing piece was upstream of all of it.
   the missing protocol and aborted the daemon; and the unified network device reads one-byte
   ADAM commands (set parser, HTTP channel mode) from SIO's second parameter slot, which an ADAM
   packet does not have. A fourth: the PC daemon saved its config without `[Serial] baud` for
-  any platform but the CoCo, so after CONFIG's first save it came back at 57,600. The program's
-  HTTPS requests still fail in the ARM daemon's TLS ("-0x7780"); the Mac build fetches them.
+  any platform but the CoCo, so after CONFIG's first save it came back at 57,600. Two more regressions made the forecast
+  fail and then come out wrong (a line feed in query values, a 256 byte cap on open specs);
+  with those fixed weather.ddp shows the San Francisco forecast. Only api.geotimezone.com
+  fails, its server refusing TLS to every client.
   `HANDOFF.md` has the install as it stands on mister192.
+- **ADAM CP/M from FujiNet, 2026-11-09:** a tester of the 20261108 package sent fixes (`TODO.md`
+  0a): FujiNet disks answer a new block busy-first as the local ones do, a lost CLR is re-polled
+  instead of failing, and the ADAM is held in reset after a load until Main's UART mode arrives.
+  In the simulator CP/M 2.2 served from FujiNet-PC's SD host stopped with a blank screen after
+  the boot loader before them and reaches `A>` with them; with the new stand-in it reaches `A>`
+  at 300 ms a block, with every third CLR lost (eight recovered), and with the UART mode arriving
+  60 ms late. CONFIG still boots (34 block fetches, was 67) and weather.ddp shows its forecast.
+  The tester reports `A>` and `DIR` on their board, and CONFIG 5 of 5 loads from the menu.
+  `docs/builds/ColecoAdam_fujinet_20261109.rbf`: 40% of ALMs, `clk_sys` slack +4.75 ns.
 
 ## Still open
 - **System Hardware Test and ADAM Final Test 3.3 are not black after all** (checked 2026-09-18 in

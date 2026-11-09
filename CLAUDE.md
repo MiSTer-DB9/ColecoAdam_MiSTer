@@ -68,7 +68,8 @@ its 1K so 7038h is index 6038h), `--printer FILE` (the raw bytes EOS sends AdamN
 device 2; the ColEm harness in `compare/` takes the same option; add `--printer-baud N` to
 take them off the core's UART through a 16-byte FIFO, which holds the ADAM off), `--fujinet [PORT]`
 (FujiNet over a TCP socket, see below; `--fujinet-baud N`, `--fujinet-log FILE`, `--fujinet-verbose`,
-`--fujinet-nowait`), `--no-media` (don't mount `adam.dsk`/`adam.ddp` from the current directory),
+`--fujinet-nowait`, `--fujinet-config F`; `--fuji-disk FILE` swaps FujiNet-PC for a stand-in serving one
+disk, with `--fuji-latency MS`, `--fuji-drop-clr N` and `--fuji-enable-at MS`), `--no-media` (don't mount `adam.dsk`/`adam.ddp` from the current directory),
 `--record FILE` and `--replay FILE`. Frames are saved as 320×240 PPMs.
 
 `--record`/`--replay` are for faults somewhere a scripted `--press` cannot reach. Play the game
@@ -156,7 +157,10 @@ programs reach the Fuji gateway (device F) and the network devices (9, A).
   spaced wider than that or the second is thrown away (the re-poll and the reset broadcast are).
   After a reset the core sends MN_RESET to every FujiNet device, then probes the gateway for up to
   8 s, so a daemon still starting is found by EOS's device scan. Main sends the UART mode after
-  the ADAM has booted, so entering or leaving FujiNet mode resets the ADAM (`ColecoAdam.sv`).
+  the core has started (mode 0 first, then the saved one), so after a load the ADAM is held in
+  reset until a mode arrives (1.5 s at most), and entering or leaving FujiNet mode resets it for
+  1.5 ms (`ColecoAdam.sv`). A FujiNet disk answers a READ of a new block busy (9Bh) first, as
+  the local disks do: ADAM CP/M's read-ahead must not complete.
 - The companion repo is `../FujiNet_MiSTer`: `build-docker.sh ADAM` cross-builds it into
   `dist/fujinet-adam/`, `config/fnconfig-adam.ini` is its config (`[Serial] port=/dev/ttyS1`, the
   baud the launcher fills in), `scripts/uartmode.fujinet` is `/sbin/uartmode` with mode 8 picking
@@ -167,6 +171,8 @@ In the simulator the far end is a TCP socket instead of the tty: `--fujinet` lis
 65216, the native FujiNet-PC ADAM build connects to it (its default Bus-over-IP peer, the same way
 ADAMEm does), and the core's UART pins are bridged to the socket in `verilator/sim_fujinet.cpp`.
 `verilator/fujinet_test.sh OUTDIR [options]` runs the pair; a CONFIG boot takes about 600 frames.
+Without a daemon, `--fuji-disk FILE` puts the stand-in in `verilator/sim_fuji.h` behind the same
+pins: it serves one disk as device 4, with a set block latency and lost CLRs on request.
 `MULTI_PLATFORM.md` in the companion repo has the native build recipe (`build_host/` there holds
 one, with `run/fnconfig.ini` for the socket: `[BOIP] enabled=1`). In every FujiNet-PC config the
 dummy WiFi must be *enabled*: the socket channel refuses to connect without it, and on the MiSTer
