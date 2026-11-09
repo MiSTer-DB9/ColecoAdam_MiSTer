@@ -132,6 +132,10 @@ module cv_adamnet
    // emulated here but reached over the AdamNet wire, byte by byte through
    // cv_fuji_uart (see cv_adamnet_master and the is_fuji rule below).
    input logic                  fuji_en,
+   // OSD "FujiNet: boot CONFIG": held high across the ADAM reset that goes with
+   // it, until fuji_boot_cfg_ack says the daemon has CONFIG in slot 1 again
+   input logic                  fuji_boot_cfg,
+   output logic                 fuji_boot_cfg_ack,
    output logic [7:0]           fuji_tx_data,
    output logic                 fuji_tx_wr,
    input logic                  fuji_tx_busy,
@@ -328,6 +332,12 @@ module cv_adamnet
   //--------------------------------------------------------------------------
   logic [14:0] fuji_pending;      // DCBs with a command waiting for the wire
   logic [7:0]  fuji_cmd[15];      // and what it was
+  logic [31:0] fuji_lastblock[4]; // FujiNet disks 1-4: the block last answered busy
+
+  // The DCB the Z80 is writing: is it a FujiNet disk (4-7), and which block
+  wire        fj_dcb_is_disk = ({dcb_table[dcb_dev].dcb_dev_num[3:0], dcb_table[dcb_dev].dcb_add_code[3:2]} == 6'b000001);
+  wire [31:0] fj_dcb_block   = {dcb_table[dcb_dev].dcb_sec_num_3, dcb_table[dcb_dev].dcb_sec_num_2,
+                                dcb_table[dcb_dev].dcb_sec_num_1, dcb_table[dcb_dev].dcb_sec_num_0};
 
   // job state machine -> the DCB block
   logic        fj_clear;          // drop fuji_pending[fj_dev]
@@ -463,6 +473,7 @@ module cv_adamnet
         for (int i = 0; i < 4; i++) begin
           disk_lastblock[i] <= '1;
           tape_lastblock[i] <= '1;
+          fuji_lastblock[i] <= '1;
         end
         adam_state   <= IDLE;
       end // case: MOVE_PCB
@@ -532,7 +543,27 @@ module cv_adamnet
                     // DCB busy. The job state machine finishes it.
                     if (z80_wr) begin
                       case (z80_data_wr)
-                        CMD_STATUS, CMD_SOFT_RESET, CMD_WRITE, CMD_READ: begin
+                        CMD_READ: begin
+                          // A disk answers a block it has not been asked for just before
+                          // with 9Bh, busy, and moves nothing; asking again gets the data.
+                          // The local disks do the same (disk_lastblock, below), EOS
+                          // retries on 9Bh, and ADAM CP/M's boot loader depends on it: it
+                          // reads every block twice and fires a read-ahead into its
+                          // buffer at EE3Bh after the last BIOS block, which would land
+                          // on the BIOS it has just loaded there.
+                          if (fj_dcb_is_disk &&
+                              fj_dcb_block != fuji_lastblock[dcb_table[dcb_dev].dcb_add_code[1:0]]) begin
+                            dcb_table[dcb_dev].dcb_cmd_stat <= RSP_BUSY;
+                            fuji_lastblock[dcb_table[dcb_dev].dcb_add_code[1:0]] <= fj_dcb_block;
+                          end else begin
+                            dcb_table[dcb_dev].dcb_cmd_stat <= '0;
+                            fuji_pending[dcb_dev]           <= '1;
+                            fuji_cmd[dcb_dev]               <= z80_data_wr;
+                            if (fj_dcb_is_disk)
+                              fuji_lastblock[dcb_table[dcb_dev].dcb_add_code[1:0]] <= '1;
+                          end
+                        end
+                        CMD_STATUS, CMD_SOFT_RESET, CMD_WRITE: begin
                           dcb_table[dcb_dev].dcb_cmd_stat <= '0;
                           fuji_pending[dcb_dev]           <= '1;
                           fuji_cmd[dcb_dev]               <= z80_data_wr;
@@ -1395,6 +1426,7 @@ module cv_adamnet
 
   always_ff @(posedge clk_i) begin
     fm_req     <= '0;
+    fuji_boot_cfg_ack <= '0;
     fm_buf_wr  <= '0;
     fj_ram_wr  <= '0;
     fj_ram_rd  <= '0;
@@ -1424,6 +1456,14 @@ module cv_adamnet
           fm_req        <= '1;
           fj_probe_pend <= '0;
           fj_state      <= FJ_AUX;
+        end else if (fuji_en && fuji_boot_cfg && fuji_online && !fuji_boot_cfg_ack) begin
+          // After the probe and before any DCB: EOS's first look at disk 1
+          // waits in the queue until CONFIG is back in FujiNet's slot 1.
+          fm_op         <= FOP_BOOT_CONFIG;
+          fm_dev        <= 4'hF;
+          fm_patient    <= '0;
+          fm_req        <= '1;
+          fj_state      <= FJ_AUX;
         end else if (|fuji_waiting) begin
           // the lowest numbered DCB waiting (the loop's last assignment wins)
           for (int i = 14; i >= 0; i--) if (fuji_waiting[i]) fj_dev <= i;
@@ -1434,6 +1474,10 @@ module cv_adamnet
       // a reset broadcast or the probe: nothing to write back
       FJ_AUX: begin
         if (fm_done) begin
+          if (fm_op == FOP_BOOT_CONFIG) begin
+            fuji_boot_cfg_ack <= '1;      // done or refused: either way, don't retry
+            $display("Adamnet (HDL): FujiNet boot CONFIG -> %02x", fm_result);
+          end
           if (fm_op == FOP_STATUS) begin
             fuji_online <= (fm_result == FRES_OK);
             $display("Adamnet (HDL): FujiNet gateway %s", fm_result == FRES_OK ? "answered" : "did not answer");

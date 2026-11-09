@@ -246,6 +246,9 @@ parameter CONF_STR = {
         // zeroed status word still means the expander the core has always defaulted to.
         "OHJ,Expansion RAM,64K,256K,512K,1M,2M,None;",
         "R0,Reset;",
+        // FujiNet keeps whatever CONFIG last mounted in its slot 1 until the daemon
+        // restarts; this asks it for CONFIG again and resets the ADAM into it.
+        "RK,FujiNet: boot CONFIG;",
         "J,Fire 1,Fire 2,*,#,0,1,2,3,4,5,6,7,8,9,Purple Tr,Blue Tr;",
         "V,v",`BUILD_DATE
 };
@@ -380,14 +383,43 @@ wire fuji_en = (uart_mode == 8'd8) && (uart_speed != 0);
 reg  old_fuji_en = 0;
 always @(posedge clk_sys) old_fuji_en <= fuji_en;
 
-wire reset = RESET | status[0] | buttons[1] | old_mode != mode | ioctl_download | old_fuji_en != fuji_en;
+// Held for 1.5 ms (64K clocks) rather than one clock, so that every part of the ADAM sees it:
+// the Z80 runs on a 3.58 MHz enable.
+reg [15:0] fuji_rst_cnt = 0;
+always @(posedge clk_sys) begin
+        if (old_fuji_en != fuji_en) fuji_rst_cnt <= 16'hFFFF;
+        else if (fuji_rst_cnt != 0) fuji_rst_cnt <= fuji_rst_cnt - 1'd1;
+end
+wire fuji_rst = (old_fuji_en != fuji_en) || (fuji_rst_cnt != 0);
+
+// Hold the ADAM in reset after the core loads until Main has set a UART mode, or for 1.5 s if
+// the mode stays None, so the ADAM boots once, in the mode it will run in. Main sends mode 0
+// first, runs "uartmode 0", and only then sends the saved mode; when that is FujiNet, the reset
+// above used to land a few ms into EOS's start, and EOS came back without scanning for devices,
+// never showed a picture and never spoke to FujiNet (a black screen, loaded from the menu).
+reg [25:0] boot_hold = 26'd64_000_000;
+always @(posedge clk_sys) begin
+        if (uart_mode != 0 && uart_speed != 0) boot_hold <= 0;
+        else if (boot_hold != 0) boot_hold <= boot_hold - 1'd1;
+end
+
+// OSD "FujiNet: boot CONFIG" (status[20], a momentary R option): reset the ADAM and hold the
+// request across the reset until cv_adamnet has had the daemon put CONFIG back in slot 1.
+wire fuji_boot_cfg_ack;
+reg  fuji_boot_cfg = 0;
+always @(posedge clk_sys) begin
+        if (status[20] && fuji_en) fuji_boot_cfg <= 1;
+        else if (fuji_boot_cfg_ack || !fuji_en) fuji_boot_cfg <= 0;
+end
+
+wire reset = RESET | status[0] | status[20] | buttons[1] | old_mode != mode | ioctl_download | fuji_rst | (boot_hold != 0);
 
 // Loading a cartridge in Computer mode acts as the ADAM's cartridge reset switch: it starts with
 // OS-7, 24K of RAM and the cartridge (ADAM Technical Manual 2.6). Reset returns to SmartWRITER.
 reg game_reset = 0;
 always @(posedge clk_sys) begin
         if (ioctl_download && ioctl_index[5:0] == 1) game_reset <= 1;
-        else if (RESET | status[0] | buttons[1] | old_mode != mode | old_fuji_en != fuji_en) game_reset <= 0;
+        else if (RESET | status[0] | status[20] | buttons[1] | old_mode != mode | fuji_rst) game_reset <= 0;
 end
 
 /////////////////  Memory  ////////////////////////
@@ -791,6 +823,8 @@ cv_console
         .prn_ready(prn_ready),
 
         .fuji_en(fuji_en),
+        .fuji_boot_cfg(fuji_boot_cfg),
+        .fuji_boot_cfg_ack(fuji_boot_cfg_ack),
         .fuji_tx_data(fuji_tx_data),
         .fuji_tx_wr(fuji_tx_wr),
         .fuji_tx_busy(fuji_tx_busy),

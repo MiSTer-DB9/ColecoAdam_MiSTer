@@ -141,6 +141,8 @@ module cv_console
    input                        prn_ready,
    // FujiNet: AdamNet wire bytes to and from cv_fuji_uart at the top level
    input                        fuji_en,
+   input                        fuji_boot_cfg,      // OSD: put FujiNet's CONFIG back in slot 1
+   output logic                 fuji_boot_cfg_ack,
    output logic [7:0]           fuji_tx_data,
    output logic                 fuji_tx_wr,
    input                        fuji_tx_busy,
@@ -630,6 +632,8 @@ module cv_console
      .adamnet_dout,
 
      .fuji_en,
+     .fuji_boot_cfg,
+     .fuji_boot_cfg_ack,
      .fuji_tx_data,
      .fuji_tx_wr,
      .fuji_tx_busy,

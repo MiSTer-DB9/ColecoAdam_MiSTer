@@ -22,6 +22,8 @@
 //   char write  MN_SEND [len BE][bytes][cksum] -> ACK or NAK
 //   char read   MN_RECEIVE -> ACK (NAK = nothing to read); MN_CLR -> [B|dev][len BE][bytes][cksum]
 //   reset       MN_RESET, no reply
+//   boot CONFIG MN_SEND to F [00 02][D6 00][D6] -> ACK: the Fuji device's
+//               SET_BOOT_MODE 0, which puts its CONFIG disk back into slot 1
 //
 // The checksum is the XOR of the payload bytes. Lengths in data packets are
 // big-endian; the one inside the status packet is little-endian.
@@ -97,7 +99,9 @@ module cv_adamnet_master
   localparam [31:0] T_POLL     = CLK_PER_MS * 50;     // one RECEIVE re-poll (an ACK to the last
                                                       // one seen on a MiSTer took over 5 ms)
   localparam [31:0] T_BYTE     = CLK_PER_MS * 100;    // between bytes of a packet
-  localparam [31:0] T_DATA     = CLK_PER_MS * 8000;   // data header after CLR
+  localparam [31:0] T_QUIET    = CLK_PER_MS * 5;      // line quiet this long before CLR
+  localparam [31:0] T_HDR      = CLK_PER_MS * 500;    // data header after CLR: the device
+                                                      // ACKed RECEIVE, so it has the data
   localparam [31:0] T_TOTAL    = CLK_PER_MS * 20000;  // re-poll budget, block devices (a TNFS fetch, retried)
   localparam [31:0] T_CHAR     = CLK_PER_MS * 5000;   // re-poll budget, character devices: a network
                                                       // device with nothing to read answers nothing
@@ -112,8 +116,9 @@ module cv_adamnet_master
     ST_SEND, ST_WAIT, ST_BYTE, ST_TMO,
     RS_SEND,
     RA_SEND, RA_NEXT,
+    BC_SEND,
     BN_HDR, BN_ACK, BN_RSP,
-    RR_POLL, RR_WAITACK, RR_POLLRSP, RR_POLLTMO, RR_CLR, RR_HDRWAIT, RR_HDR,
+    RR_POLL, RR_WAITACK, RR_POLLRSP, RR_POLLTMO, RR_DRAIN, RR_CLR, RR_HDRWAIT, RR_HDRTMO, RR_HDR,
     RR_LENHI, RR_LENLO, RR_DATACHK, RR_DATA, RR_CKSUM,
     WR_HDR, WR_FETCH, WR_FETCH2, WR_BYTE, WR_NEXT, WR_CKSUM, WR_ACKWAIT, WR_ACK
   } state_t;
@@ -211,6 +216,7 @@ module cv_adamnet_master
             FOP_WRITE_BLOCK: gap_next <= BN_HDR;
             FOP_CHAR_WRITE:  gap_next <= WR_HDR;
             FOP_CHAR_READ:   gap_next <= RR_POLL;
+            FOP_BOOT_CONFIG: gap_next <= BC_SEND;
             default:         gap_next <= S_FAIL;
           endcase
         end
@@ -340,6 +346,22 @@ module cv_adamnet_master
       end
 
       //------------------------------------------------------------------
+      // Boot CONFIG: a two byte SEND to the Fuji device, then its ACK
+      //------------------------------------------------------------------
+      BC_SEND: begin
+        seq[0]   <= {MN_SEND, dev};
+        seq[1]   <= 8'h00;
+        seq[2]   <= 8'h02;
+        seq[3]   <= 8'hD6;                 // FUJI_SET_BOOT_MODE
+        seq[4]   <= 8'h00;                 // 0: the CONFIG disk
+        seq[5]   <= 8'hD6;                 // checksum: D6 ^ 00
+        seq_len  <= 4'd6;
+        seq_idx  <= '0;
+        seq_next <= WR_ACKWAIT;
+        state    <= S_TXSEQ;
+      end
+
+      //------------------------------------------------------------------
       // Block number: MN_SEND, length 5, block little-endian plus a zero
       //------------------------------------------------------------------
       BN_HDR: begin
@@ -395,9 +417,8 @@ module cv_adamnet_master
       end
       RR_POLLRSP: begin
         if (rx_byte == {NM_ACK, dev}) begin
-          timer    <= T_GAP;               // and drop the ACKs to any earlier re-polls
-          gap_next <= RR_CLR;
-          state    <= S_GAP;
+          timer <= T_QUIET;
+          state <= RR_DRAIN;
         end else if (rx_byte == {NM_NAK, dev}) begin
           result <= FRES_RECV_NACK;        // nothing to read
           state  <= S_DONE;
@@ -416,6 +437,20 @@ module cv_adamnet_master
           state    <= S_GAP;
         end
       end
+      // Drop the ACKs to earlier re-polls until the line has been quiet for T_QUIET. A
+      // device that was fetching answers every re-poll queued meanwhile, one by one, and
+      // FujiNet-PC throws away input that arrives while it is still busy with them: a
+      // CLR sent into that is lost, and the device never sends its data.
+      RR_DRAIN: begin
+        if (rx_avail) begin
+          rx_rd <= '1;
+          timer <= T_QUIET;
+        end else if (timer == 0) begin
+          state <= RR_CLR;
+        end else begin
+          timer <= timer - 1'b1;
+        end
+      end
       RR_CLR: begin
         seq[0]   <= {MN_CLR, dev};
         seq_len  <= 4'd1;
@@ -425,10 +460,22 @@ module cv_adamnet_master
       end
       RR_HDRWAIT: begin
         result      <= FRES_CLR_TIMEOUT;   // also for a packet that stops part way
-        timer       <= T_DATA;
+        timer       <= T_HDR;
         rx_next     <= RR_HDR;
-        rx_tmo_next <= S_FAIL;
+        rx_tmo_next <= RR_HDRTMO;
         state       <= S_RX;
+      end
+      RR_HDRTMO: begin
+        // The CLR went unanswered, so it was lost: the device still has the data, and
+        // answers another RECEIVE with an ACK. Ask again, within the budget, rather
+        // than leave an error in the DCB, which ADAM CP/M's BIOS never gets past.
+        if (total >= (is_block ? T_TOTAL : T_CHAR)) begin
+          state <= S_FAIL;
+        end else begin
+          timer    <= T_GAP;
+          gap_next <= RR_POLL;
+          state    <= S_GAP;
+        end
       end
       RR_HDR: begin
         if (rx_byte == {NM_SEND, dev}) begin

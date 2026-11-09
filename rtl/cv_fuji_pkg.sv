@@ -17,6 +17,7 @@ package cv_fuji_pkg;
   localparam [2:0] FOP_CHAR_READ   = 3'd4;  // RECEIVE until ACK (or NAK = nothing), CLR, bytes back
   localparam [2:0] FOP_RESET       = 3'd5;  // MN_RESET to one device, no reply
   localparam [2:0] FOP_RESET_ALL   = 3'd6;  // MN_RESET to every device FujiNet serves
+  localparam [2:0] FOP_BOOT_CONFIG = 3'd7;  // Fuji SET_BOOT_MODE (D6h) 0: CONFIG back into slot 1
 
   // Results, as DCB status bytes: the master 6801's completion codes (FujiNet
   // Programming Guide for the ADAM, Appendix A)
