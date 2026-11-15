@@ -162,6 +162,9 @@ module tv80_core (/*AUTOARG*/
   reg [7:0]     DI_Reg;
   reg           T_Res;
   reg [1:0]     XY_State;
+  wire          XYbit_undoc;
+  wire          Save_TmpL;
+  reg           Save_TmpL_r;
   reg [2:0]     Pre_XY_F_M;
   reg           NextIs_XY_Fetch;
   reg           XY_Ind;
@@ -177,6 +180,8 @@ module tv80_core (/*AUTOARG*/
   reg [7:0]     BusA;
   wire [7:0]    ALU_Q;
   wire [7:0]    F_Out;
+  wire [8:0]    ioq = {1'b0, DI_Reg} + {1'b0, ID16[7:0]};
+  wire [7:0]    CP_n = ALU_Q - {7'b0, F_Out[Flag_H]};
 
   // Registered micro code outputs
   reg [4:0]     Read_To_Reg_r;
@@ -229,6 +234,7 @@ module tv80_core (/*AUTOARG*/
   wire           I_BTR;
   wire           I_RLD;
   wire           I_RRD;
+  reg            I_RXDD;
   wire           I_INRC;
   wire           SetDI;
   wire           SetEI;
@@ -294,7 +300,10 @@ module tv80_core (/*AUTOARG*/
      .IMode                (IMode),
      .Halt                 (Halt),
      .NoRead               (no_read),
-     .Write                (write)
+     .Write                (write),
+     .XYbit_undoc          (XYbit_undoc),
+     .Save_TmpL            (Save_TmpL),
+     .XY_State             (XY_State)
      );
 
   tv80_alu #(Mode, Flag_C, Flag_N, Flag_P, Flag_X, Flag_H, Flag_Y, Flag_Z, Flag_S) i_alu
@@ -369,7 +378,7 @@ module tv80_core (/*AUTOARG*/
     end // always @ (...
   
           
-  always @(/*AUTOSENSE*/ALU_Q or BusAck or BusB or DI_Reg
+  always @(/*AUTOSENSE*/ALU_Q or BusAck or BusB or DI_Reg or Save_TmpL_r or TmpAddr
 	   or ExchangeRp or IR or Save_ALU_r or Set_Addr_To or XY_Ind
 	   or XY_State or cen or last_tstate or mcycle)
     begin
@@ -389,6 +398,8 @@ module tv80_core (/*AUTOARG*/
 
       if (ExchangeRp)
         Save_Mux = BusB;
+      else if (Save_TmpL_r)
+        Save_Mux = TmpAddr[7:0];
       else if (!Save_ALU_r)
         Save_Mux = DI_Reg;
       else
@@ -402,6 +413,7 @@ module tv80_core (/*AUTOARG*/
           PC <= `TV80DELAY 0;  // Program Counter
           A <= `TV80DELAY 0;
           TmpAddr <= `TV80DELAY 0;
+          I_RXDD <= `TV80DELAY 1'b0;
           IR <= `TV80DELAY 8'b00000000;
           // ir_changed <= 1'b1;
           ISet <= `TV80DELAY 2'b00;
@@ -422,6 +434,7 @@ module tv80_core (/*AUTOARG*/
           Alternate <= `TV80DELAY 1'b0;
 
           Read_To_Reg_r <= `TV80DELAY 5'b00000;
+          Save_TmpL_r <= `TV80DELAY 1'b0;
           Arith16_r <= `TV80DELAY 1'b0;
           BTR_r <= `TV80DELAY 1'b0;
           Z16_r <= `TV80DELAY 1'b0;
@@ -439,6 +452,7 @@ module tv80_core (/*AUTOARG*/
               ALU_Op_r <= `TV80DELAY 4'b0000;
               Save_ALU_r <= `TV80DELAY 1'b0;
               Read_To_Reg_r <= `TV80DELAY 5'b00000;
+              Save_TmpL_r <= `TV80DELAY 1'b0;
 
               mcycles <= `TV80DELAY mcycles_d;
 
@@ -770,20 +784,30 @@ module tv80_core (/*AUTOARG*/
                             F[Flag_P] <= `TV80DELAY IntE_FF2;
 			    F[Flag_Z] <= (I == 0);
 			    F[Flag_S] <= I[7];
+			    F[Flag_Y] <= I[5];  // undocumented: bits 5/3 copy the result
+			    F[Flag_X] <= I[3];
 			    F[Flag_H] <= 0;
 			    F[Flag_N] <= 0; 
                           end
                         
                         2'b01 :
                           begin
+                            // LD A,R: S and Z come from the value loaded (UM0080 LD A,R:
+                            // "S is set if, R-Register is negative", "Z is set if the R Register is 0")
                             `ifdef TV80_REFRESH
                             ACC <= `TV80DELAY R;
+                            F[Flag_Z] <= (R == 0);
+                            F[Flag_S] <= R[7];
+                            F[Flag_Y] <= R[5];
+                            F[Flag_X] <= R[3];
                             `else
                             ACC <= `TV80DELAY 0;
+                            F[Flag_Z] <= 1'b1;
+                            F[Flag_S] <= 1'b0;
+                            F[Flag_Y] <= 1'b0;
+                            F[Flag_X] <= 1'b0;
                             `endif
                             F[Flag_P] <= `TV80DELAY IntE_FF2;
-			    F[Flag_Z] <= (I == 0);
-			    F[Flag_S] <= I[7];
 			    F[Flag_H] <= 0;
 			    F[Flag_N] <= 0; 
                           end
@@ -801,6 +825,16 @@ module tv80_core (/*AUTOARG*/
                     end
                 end // if (tstate == 3 )
               
+
+              // INI/IND/OUTI/OUTD and repeats: k = data + (C+-1) for IN, data + L for OUT;
+              // N = data bit 7, H = C = carry of k, P = parity((k & 7) ^ B) (Young 4.3; as T80)
+              if ((tstate[2] && I_BTR && IR[0]) || (tstate[1] && I_BTR && !IR[0]))
+                begin
+                  F[Flag_N] <= `TV80DELAY DI_Reg[7];
+                  F[Flag_C] <= `TV80DELAY ioq[8];
+                  F[Flag_H] <= `TV80DELAY ioq[8];
+                  F[Flag_P] <= `TV80DELAY ~ (^((ioq[7:0] & 8'h07) ^ BusA));
+                end
 
               if ((I_DJNZ == 1'b0 && Save_ALU_r == 1'b1) || ALU_Op_r == 4'b1001 ) 
                 begin
@@ -822,6 +856,13 @@ module tv80_core (/*AUTOARG*/
                           F[Flag_C] <= `TV80DELAY F_Out[0];
                         end
                     end
+                  // BIT b,(IX+d) / (IY+d): flags 5/3 are bits 13/11 of IX+d (Young 4.1;
+                  // IX+d is held in TmpAddr)
+                  if (ALU_Op_r == 4'b1001 && XY_Ind == 1'b1 && Mode != 3)
+                    begin
+                      F[Flag_Y] <= `TV80DELAY TmpAddr[13];
+                      F[Flag_X] <= `TV80DELAY TmpAddr[11];
+                    end
                 end // if ((I_DJNZ == 1'b0 && Save_ALU_r == 1'b1) || ALU_Op_r == 4'b1001 )
               
               if (T_Res == 1'b1 && I_INRC == 1'b1 ) 
@@ -837,13 +878,18 @@ module tv80_core (/*AUTOARG*/
                       F[Flag_Z] <= `TV80DELAY 1'b0;
                     end
                   F[Flag_S] <= `TV80DELAY DI_Reg[7];
+                  F[Flag_Y] <= `TV80DELAY DI_Reg[5];  // undocumented: copies of the byte read (as T80)
+                  F[Flag_X] <= `TV80DELAY DI_Reg[3];
                   F[Flag_P] <= `TV80DELAY ~ (^DI_Reg[7:0]);
                 end // if (T_Res == 1'b1 && I_INRC == 1'b1 )
               
 
               if (tstate[1] && Auto_Wait_t1 == 1'b0 ) 
                 begin
-                  dout <= `TV80DELAY BusB;
+                  // Keep dout from M3 for RLD/RRD (as Sorgelig's T80)
+                  I_RXDD <= `TV80DELAY I_RLD | I_RRD;
+                  if (!I_RXDD)
+                    dout <= `TV80DELAY BusB;
                   if (I_RLD == 1'b1 ) 
                     begin
                       dout[3:0] <= `TV80DELAY BusA[3:0];
@@ -860,6 +906,7 @@ module tv80_core (/*AUTOARG*/
                 begin
                   Read_To_Reg_r[3:0] <= `TV80DELAY Set_BusA_To;
                   Read_To_Reg_r[4] <= `TV80DELAY Read_To_Reg;
+                  Save_TmpL_r <= `TV80DELAY Save_TmpL;
                   if (Read_To_Acc == 1'b1 ) 
                     begin
                       Read_To_Reg_r[3:0] <= `TV80DELAY 4'b0111;
@@ -873,6 +920,12 @@ module tv80_core (/*AUTOARG*/
                   F[Flag_Y] <= `TV80DELAY ALU_Q[1];
                   F[Flag_H] <= `TV80DELAY 1'b0;
                   F[Flag_N] <= `TV80DELAY 1'b0;
+                end
+              if (tstate[1] && I_BC == 1'b1 )
+                begin
+                  // CPI/CPD/CPIR/CPDR: n = A - (HL) - H; flags 5/3 are n bits 1/3 (Young 4.2; as T80)
+                  F[Flag_X] <= `TV80DELAY CP_n[3];
+                  F[Flag_Y] <= `TV80DELAY CP_n[1];
                 end
               if (I_BC == 1'b1 || I_BT == 1'b1 ) 
                 begin
@@ -895,6 +948,8 @@ module tv80_core (/*AUTOARG*/
                       F <= `TV80DELAY Save_Mux;
                     default : ;
                   endcase
+                  if (XYbit_undoc)
+                    dout <= `TV80DELAY ALU_Q;  // DDCB/FDCB register-copy: also write the result back to (IX+d)
                 end // if ((tstate == 1 && Save_ALU_r == 1'b0 && Auto_Wait_t1 == 1'b0) ||...              
             end // if (ClkEn == 1'b1 )         
         end // else: !if(reset_n == 1'b0 )
@@ -961,10 +1016,13 @@ module tv80_core (/*AUTOARG*/
   always @(/*AUTOSENSE*/Alternate or ExchangeDH or IncDec_16
 	   or RegAddrA_r or RegAddrB_r or XY_State or mcycle or tstate)
     begin
-      if ((tstate[2] || (tstate[3] && mcycle[0] && IncDec_16[2] == 1'b1)) && XY_State == 2'b00)
-        RegAddrA = { Alternate, IncDec_16[1:0] };
-      else if ((tstate[2] || (tstate[3] && mcycle[0] && IncDec_16[2] == 1'b1)) && IncDec_16[1:0] == 2'b10)
+      // 16-bit INC/DEC: a DD/FD prefix only redirects HL to IX/IY. INC/DEC BC/DE under
+      // a prefix still address BC/DE (previously DD 13 / DD 1B fell through to
+      // RegAddrA_r and changed BC).
+      if ((tstate[2] || (tstate[3] && mcycle[0] && IncDec_16[2] == 1'b1)) && XY_State != 2'b00 && IncDec_16[1:0] == 2'b10)
         RegAddrA = { XY_State[1], 2'b11 };
+      else if (tstate[2] || (tstate[3] && mcycle[0] && IncDec_16[2] == 1'b1))
+        RegAddrA = { Alternate, IncDec_16[1:0] };
       else if (ExchangeDH == 1'b1 && tstate[3])
         RegAddrA = { Alternate, 2'b10 };
       else if (ExchangeDH == 1'b1 && tstate[4])
@@ -1131,6 +1189,12 @@ module tv80_core (/*AUTOARG*/
             default :
               BusA <= `TV80DELAY  8'h0;
           endcase
+          if (XYbit_undoc)
+            begin
+              // DDCB/FDCB register-copy forms operate on (IX+d), not on r
+              BusA <= `TV80DELAY DI_Reg;
+              BusB <= `TV80DELAY DI_Reg;
+            end
         end
     end
 
@@ -1406,7 +1470,9 @@ module tv80_core (/*AUTOARG*/
   always @(/*AUTOSENSE*/IntCycle or NMICycle or mcycle)
     begin
       Auto_Wait = 1'b0;
-      if (IntCycle == 1'b1 || NMICycle == 1'b1 ) 
+      // two automatic waits only in the INT acknowledge (IORQ M1); the NMI acknowledge
+      // is an ordinary 5 T opcode fetch (UM0080 NMI timing; as T80)
+      if (IntCycle == 1'b1 ) 
         begin
           if (mcycle[0] ) 
             begin
