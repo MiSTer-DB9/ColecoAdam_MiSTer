@@ -327,17 +327,20 @@ module cv_console
   assign clk_en_3m58_n_s = (clk_cnt_q == 2'b10) ? clk_en_10m7_i : '0;
 
   //---------------------------------------------------------------------------
-  // T80 CPU
+  // Z80 CPU: t80sv_T80pa (rtl/t80sv), Mode 0. A SystemVerilog translation of T80,
+  // the CPU of Arnim Laeuger's original ColecoVision core, with fixes that pass every
+  // SingleStepTests/z80 case including bus cycle order and strobe positions
+  // (rtl/t80sv/README.md). Both clock phases drive it, so its strobes have the Z80's
+  // half T-state shapes (UM0080 Figs. 5-8). Define CPU_TV80 to build with tv80e instead,
+  // the CPU this core used until 2026-11, which has one-T-state strobes.
   //---------------------------------------------------------------------------
 
-//  `ifdef VERILATOR
-
+`ifdef CPU_TV80
   tv80e Cpu
     (
      .reset_n     (reset_n_s),
      .clk         (clk_i),
      .cen         (clk_en_3m58_p_s),
-     //.cen_n(clk_en_3m58_n_s),
      .wait_n      (wait_n_s),
      .int_n       (int_n_s),
      .nmi_n       (nmi_n_s),
@@ -354,33 +357,35 @@ module cv_console
      .di          (d_to_cpu_s),
      .dout        (d_from_cpu_s)
      );
-/*
-  `else
-
-  T80pa #(.mode(0)) t80a_b(
-                           .reset_n(reset_n_s),
-                           .clk(clk_i),
-                           .cen_p(clk_en_3m58_p_s),
-                           .cen_n(clk_en_3m58_n_s),
-                           .wait_n(wait_n_s),
-                           .int_n(int_n_s),
-                           .nmi_n(nmi_n_s),
-                           .busrq_n((USE_REQ == 1) ? adamnet_req_n : vdd_s),
-                           .m1_n(m1_n_s),
-                           .mreq_n(mreq_n_s),
-                           .iorq_n(iorq_n_s),
-                           .rd_n(rd_n_s),
-                           .wr_n(wr_n_s),
-                           .rfsh_n(rfsh_n_s),
-                           .halt_n(),
-                           .busak_n(adamnet_ack_n),
-                           .a(a_s),
-                           .di(d_to_cpu_s),
-                           .dout(d_from_cpu_s)
-                           );
-
+`else
+  t80sv_T80pa #(.Mode(0)) Cpu
+    (
+     .RESET_n     (reset_n_s),
+     .CLK         (clk_i),
+     .CEN_p       (clk_en_3m58_p_s),
+     .CEN_n       (clk_en_3m58_n_s),
+     .WAIT_n      (wait_n_s),
+     .INT_n       (int_n_s),
+     .NMI_n       (nmi_n_s),
+     .BUSRQ_n     ((USE_REQ == 1) ? adamnet_req_n : vdd_s),
+     .M1_n        (m1_n_s),
+     .MREQ_n      (mreq_n_s),
+     .IORQ_n      (iorq_n_s),
+     .RD_n        (rd_n_s),
+     .WR_n        (wr_n_s),
+     .RFSH_n      (rfsh_n_s),
+     .HALT_n      (),
+     .BUSAK_n     (adamnet_ack_n),
+     .OUT0        (1'b0),
+     .A           (a_s),
+     .DI          (d_to_cpu_s),
+     .DO          (d_from_cpu_s),
+     .R800_mode   (1'b0),
+     .REG         (),
+     .DIRSet      (1'b0),
+     .DIR         (212'd0)
+     );
 `endif
-*/
 
 
   //---------------------------------------------------------------------------

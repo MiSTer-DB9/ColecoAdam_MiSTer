@@ -16,7 +16,7 @@ git.
 | `ColecoAdam.sv` | MiSTer top level: hps_io, OSD (`CONF_STR`), ROMs/RAM, video, audio |
 | `sys/` | MiSTer framework, synced from upstream; don't edit |
 | `ColecoAdam.qpf/.qsf`, `files.qip` | Quartus project; `releases/` holds built `.rbf` files |
-| `rtl/cv_console.sv` | Console: tv80 Z80, M1 WAIT flip-flop, bus mux, VDP, SN76489, AY, controllers, AdamNet |
+| `rtl/cv_console.sv` | Console: Z80 (t80sv), M1 WAIT flip-flop, bus mux, VDP, SN76489, AY, controllers, AdamNet |
 | `rtl/cv_addr_dec.sv` | Memory map (port 7Fh memory select, 3Fh EOS enable, 53h SGM RAM enable, MegaCart paging) and I/O decode |
 | `rtl/cv_ctrl.sv` | Controller ports: keypad/joystick select, the port read mux, and the spinner strobe and interrupt. `cv_ctrl.vhd` is the older VHDL, no longer built |
 | `rtl/cv_spinner.sv` | Turns a spinner device or an analog axis into the pin 7/9 signalling of Coleco's roller controllers |
@@ -25,7 +25,8 @@ git.
 | `rtl/cv_printer_uart.sv` | Printer FIFO and 8N1 transmitter to the HPS UART, active when the OSD's UART connection is Printer (mode 7); `mister_printerd` in the peer `printeremulation` repo makes the PDF. `verilator/printer_tb/` tests it |
 | `rtl/track_loader_adam.sv` | Moves disk/tape blocks between AdamNet and the SD image |
 | `rtl/vdp18v/` | TMS9918A (SystemVerilog). `rtl/vdp18/` is the older VHDL |
-| `rtl/tv80/` | Z80 used by both hardware and simulation. `rtl/T80/` is unused. `TV80_REFRESH` is its only `ifdef` and is `define`d in `tv80_core.v` and `tv80e.v` themselves, not in the `.qsf` or the simulator Makefile: it went undefined in both build systems for years, which left the R register non-existent and `LD A,R` returning 0. Don't move it back into a build file |
+| `rtl/t80sv/` | Z80 used by both hardware and simulation: `t80sv_T80pa`, a SystemVerilog T80 shared with the SVI-328 core, passing every SingleStepTests/z80 case including bus cycle order and strobe positions (its `README.md`). `t80sv_fixes.patch` records the fixes on top of upstream |
+| `rtl/tv80/` | The previous Z80, still built when `CPU_TV80` is defined (`cv_console.sv`). `rtl/T80/` is unused. `TV80_REFRESH` is its only `ifdef` and is `define`d in `tv80_core.v` and `tv80e.v` themselves, not in the `.qsf` or the simulator Makefile: it went undefined in both build systems for years, which left the R register non-existent and `LD A,R` returning 0. Don't move it back into a build file |
 | `rtl/{bios,writer,eos}.hex` | OS-7 BIOS, SmartWriter, EOS. `verilator/rtl/` has identical copies for the simulator |
 | `verilator/` | Verilator simulator (see below) |
 | `verilator/compare/` | Core vs ColEm comparison framework; read its `README.md` |

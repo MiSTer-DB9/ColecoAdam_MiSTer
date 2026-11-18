@@ -1005,7 +1005,7 @@ void stepSim() {
         if (vdp_trace) {
                         int wr = VERTOPINTERN->emu__DOT__console__DOT__vdp18_b__DOT__cpu_io_b__DOT__write_reg_s;
                         if (wr && !vdp_wr_prev) {
-                                int reg = VERTOPINTERN->emu__DOT__console__DOT__d_from_cpu_s & 7;
+                                int reg = VERTOPINTERN->emu__DOT__console__DOT__Cpu__DOT__u__DOT__core_do /* t80sv data out = d_from_cpu_s */ & 7;
                                 int val = VERTOPINTERN->emu__DOT__console__DOT__vdp18_b__DOT__cpu_io_b__DOT__tmp_q;
                                 printf("vdp frame %d: R%d = %02X%s\n", video.count_frame, reg, val,
                                        reg == 1 ? ((val & 0x40) ? "  (display on)" : "  (display OFF)") : "");

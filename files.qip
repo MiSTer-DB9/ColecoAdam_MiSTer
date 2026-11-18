@@ -1,4 +1,4 @@
-set_global_assignment -name QIP_FILE rtl/T80/T80.qip
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/t80sv/t80sv_all.sv
 set_global_assignment -name VERILOG_FILE rtl/tv80/tv80s.v
 set_global_assignment -name VERILOG_FILE rtl/tv80/tv80n.v
 set_global_assignment -name VERILOG_FILE rtl/tv80/tv80_reg.v
