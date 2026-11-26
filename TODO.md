@@ -38,6 +38,84 @@ multicart reset check in section 8. None of them needs a new build any more - `c
 shipped since `releases/ColecoAdam_20260918.rbf`, and `docs/builds/ColecoAdam_20260922_refresh.rbf`
 carries the expander and the R register on top of it. `HANDOFF.md` is the checklist.
 
+## 0a. FujiNet (branch `fujinet`, 2026-11-07)
+
+The core is the AdamNet master for FujiNet-PC's devices; the simulator boots FujiNet's CONFIG
+(`STATUS.md`, FujiNet section; `CLAUDE.md` for how it fits). Open:
+
+- [x] **Hardware: CONFIG boots on mister192** (2026-11-08, `docs/builds/ColecoAdam_fujinet_20261108b.rbf`,
+  with the daemon from patch 0002 as it now stands), and `weather.ddp` from fujinet.online
+  mounts and boots. Still to do there: print from SmartWRITER (goes to FujiNet's printer) and
+  the local-floppy-wins check. `HANDOFF.md` section 4.
+- [x] **weather.ddp showed no forecast, then a wrong one.** Two more firmware regressions from
+  upstream's unified network device, fixed in patch 0003: JSON query values came back with a
+  `\n` the old ADAM code never added, which the app pasted into its forecast URL; and an open
+  spec was cut at 256 bytes, where the app's forecast URL is 513, so its units, daily and
+  timezone fields were dropped (Celsius labelled °F, 1 Jan 1970). On mister192 2026-11-08 it
+  now shows 50.7°F for San Francisco, matching open-meteo. HTTPS itself works.
+- [ ] **api.geotimezone.com refuses every TLS client** ("unrecognized name", `curl` on a Mac
+  too), so weather.ddp falls back to EST. The app's dependency, not ours.
+- [x] **Network open failed in FujiNet-PC** (found with `weather.ddp`; fixed, passed on
+  mister192 2026-11-08): the open spec the ADAM's
+  fujinet-lib sends is `03 4E 3A 48 54 54 50 ...`, a control byte before `N:HTTP://`. Upstream's
+  `util_remove_n_prefix` used to strip blindly up to the first colon and so hid it; since it
+  checks for `N:` at the very start (upstream #1603) the scheme comes out as `N` and the open
+  fails, and the program's next command, set parser (FCh), built a parser on the null protocol
+  and took the daemon down. With the open fixed the daemon still died on that command: the
+  unified `NDevice` reads a command's one parameter from the second slot (SIO's aux2), which an
+  ADAM packet does not have, and the packet class asserts. The pre-unification ADAM code read
+  the first slot. `patches/0003-*` in `FujiNet_MiSTer` drops leading control bytes from the
+  spec, refuses a parser without a protocol, and overrides set parser (FCh) and HTTP channel
+  mode (`M`) in `adamNetwork` to read the first slot. Confirm on hardware, then send upstream.
+  Also seen: the app's app-key read and write report "Invalid app key metadata", so its OPEN
+  APPKEY (DCh) never registers; the location setting will not persist.
+- [x] **The real tty is not the simulator's socket** (found on mister192, 2026-11-08). Two
+  things the socket never showed: FujiNet-PC's serial path waited only 2 ms for the rest of a
+  packet, and a Linux tty delivers bytes in chunks several ms apart, so every 9 byte block
+  request was NAKed (patch 0002 now waits 100 ms). And FujiNet-PC clears its input after each
+  command it answers, so two of our commands landing in one chunk become one: the RECEIVE
+  re-poll (was 5 ms) and the reset broadcast (was 1 ms apart) now wait 50 and 20 ms. With the
+  daemon stopped, `stty -F /dev/ttyS1 115200 raw` and `cat /dev/ttyS1 | xxd` shows what the
+  core sends; `--fujinet-log` is the simulator's equivalent.
+- [x] **Boot wait.** Main sends the UART mode a moment after the core has booted, so the first
+  EOS scan ran with FujiNet off and the ADAM sat in SmartWRITER. Entering or leaving FujiNet
+  mode now resets the ADAM (`ColecoAdam.sv`, like a Mode change). Until that build is on the
+  card, `_AdamTests/F1 FujiNet boot.mgl` loads the core with `<reset delay="10">`.
+- [x] **ADAM CP/M 2.2 from a FujiNet disk stopped after its boot loader** (fixed 2026-11-09 from
+  a tester's patches against the 20261108 package, checked on their board; here in the
+  simulator against FujiNet-PC and against the new stand-in). Three faults:
+  - A FujiNet disk completed every READ, where the local disks answer a block they were not just
+    asked for with 9Bh (busy) first, as ColEm does. CP/M's loader fires a read-ahead of block 7
+    into EE3Bh, inside the BIOS it has just loaded; completing it overwrote the BIOS.
+    `cv_adamnet` now does the same busy-first for FujiNet disks, which also halves CONFIG's
+    wire traffic (34 block fetches instead of 67).
+  - An unanswered CLR failed the read after 8 s with 8Dh, and the BIOS never gets past an error
+    in a DCB. `cv_adamnet_master` drains the line until it is quiet 5 ms before CLR, and re-polls
+    RECEIVE after 500 ms instead of failing.
+  - Loaded from the menu with FujiNet on, the ADAM sometimes came up black: Main sends mode 0,
+    runs `uartmode 0`, then the saved mode 8, and the reset that caused landed 20-75 ms into
+    EOS's start. `ColecoAdam.sv` now holds the ADAM in reset after a load until a UART mode
+    arrives (1.5 s at most, which every load in mode None now waits), and the FujiNet on/off
+    reset lasts 1.5 ms instead of one clock.
+  Also from them: `/sbin/uartmode`'s FujiNet loop has its own token, so a core reload leaves one
+  daemon, not two; and a FujiNet-PC stand-in for the simulator (`--fuji-disk`,
+  `--fuji-latency`, `--fuji-drop-clr`, `--fuji-enable-at`; `verilator/sim_fuji.h`), merged
+  into the pin-level link here.
+- [ ] **Speed.** EOS reads every block twice (`__READ_BLOCK`); since the busy-first change only
+  the second read goes over the wire, so CONFIG's 33 blocks are 33 fetches. A faster UART
+  speed in Main's list would cut it further.
+- [ ] **Character reads longer than the DCB buffer** are truncated to it; the real master's
+  behaviour there is unverified. `MN_READY` is never sent.
+- [x] **OSD "FujiNet: boot CONFIG"** (status[20]): sends the Fuji device SET_BOOT_MODE 0 (D6h),
+  which puts the daemon's CONFIG disk back in slot 1, and resets the ADAM. Without it the daemon
+  keeps whatever CONFIG last mounted until it restarts. Passed on mister192 2026-11-08 with
+  `docs/builds/ColecoAdam_fujinet_20261108d.rbf`, from weather.ddp back to CONFIG. The request
+  goes out before the reset broadcast rather than after the probe, since `fuji_online` survives
+  the reset; harmless, as MN_RESET does not unmount. Simulator: `--fujinet-config FRAME`.
+- [ ] **An OSD choice** for which disk slots FujiNet may take, instead of "any slot without an
+  image"; and a FujiNet indicator (`fuji_online` exists in `cv_adamnet`).
+- [ ] Send patch 0002 (serial port and baud from config) upstream to `fujinet-firmware`.
+
 ## 1. Try the September fixes on a MiSTer
 
 - [x] Build with Quartus: done 2026-09-13 with 17.0.2 on the Linux machine. It fits, at 84% of

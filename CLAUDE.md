@@ -16,14 +16,18 @@ git.
 | `ColecoAdam.sv` | MiSTer top level: hps_io, OSD (`CONF_STR`), ROMs/RAM, video, audio |
 | `sys/` | MiSTer framework, synced from upstream; don't edit |
 | `ColecoAdam.qpf/.qsf`, `files.qip` | Quartus project; `releases/` holds built `.rbf` files |
-| `rtl/cv_console.sv` | Console: tv80 Z80, M1 WAIT flip-flop, bus mux, VDP, SN76489, AY, controllers, AdamNet |
+| `rtl/cv_console.sv` | Console: Z80 (t80sv), M1 WAIT flip-flop, bus mux, VDP, SN76489, AY, controllers, AdamNet |
 | `rtl/cv_addr_dec.sv` | Memory map (port 7Fh memory select, 3Fh EOS enable, 53h SGM RAM enable, MegaCart paging) and I/O decode |
+| `rtl/cv_cart_detect.sv`, `rtl/cv_ocm_flash.sv` | Opcode's Super Game Cartridge ("OCM" mapper): detected from the image (header at offset 0, not in the last 16K page), four 8K bank registers at FFFC-FFFF in `cv_addr_dec`, and the cartridge's JEDEC flash, where the games save scores and options (sector 1F000h). Saves last until the cartridge is reloaded |
 | `rtl/cv_ctrl.sv` | Controller ports: keypad/joystick select, the port read mux, and the spinner strobe and interrupt. `cv_ctrl.vhd` is the older VHDL, no longer built |
 | `rtl/cv_spinner.sv` | Turns a spinner device or an analog axis into the pin 7/9 signalling of Coleco's roller controllers |
-| `rtl/cv_adamnet.sv` | AdamNet devices and the PS/2 to ADAM key tables |
+| `rtl/cv_adamnet.sv` | AdamNet devices and the PS/2 to ADAM key tables, and the FujiNet forwarding rule and job queue (see FujiNet below) |
+| `rtl/cv_adamnet_master.sv` | The AdamNet bus master for FujiNet: runs the wire protocol, one transaction per DCB command, over `rtl/cv_fuji_uart.sv`; `rtl/cv_fuji_pkg.sv` has the op and status codes |
+| `rtl/cv_printer_uart.sv` | Printer FIFO and 8N1 transmitter to the HPS UART, active when the OSD's UART connection is Printer (mode 7); `mister_printerd` in the peer `printeremulation` repo makes the PDF. `verilator/printer_tb/` tests it |
 | `rtl/track_loader_adam.sv` | Moves disk/tape blocks between AdamNet and the SD image |
 | `rtl/vdp18v/` | TMS9918A (SystemVerilog). `rtl/vdp18/` is the older VHDL |
-| `rtl/tv80/` | Z80 used by both hardware and simulation. `rtl/T80/` is unused. `TV80_REFRESH` is its only `ifdef` and is `define`d in `tv80_core.v` and `tv80e.v` themselves, not in the `.qsf` or the simulator Makefile: it went undefined in both build systems for years, which left the R register non-existent and `LD A,R` returning 0. Don't move it back into a build file |
+| `rtl/t80sv/` | Z80 used by both hardware and simulation: `t80sv_T80pa`, a SystemVerilog T80 shared with the SVI-328 core, passing every SingleStepTests/z80 case including bus cycle order and strobe positions (its `README.md`). Taken unmodified from RodimusFVC/Rodimus_Chips_MiSTer; the README names the commit |
+| `rtl/tv80/` | The previous Z80, still built when `CPU_TV80` is defined (`cv_console.sv`). `rtl/T80/` is unused. `TV80_REFRESH` is its only `ifdef` and is `define`d in `tv80_core.v` and `tv80e.v` themselves, not in the `.qsf` or the simulator Makefile: it went undefined in both build systems for years, which left the R register non-existent and `LD A,R` returning 0. Don't move it back into a build file |
 | `rtl/{bios,writer,eos}.hex` | OS-7 BIOS, SmartWriter, EOS. `verilator/rtl/` has identical copies for the simulator |
 | `verilator/` | Verilator simulator (see below) |
 | `verilator/compare/` | Core vs ColEm comparison framework; read its `README.md` |
@@ -62,8 +66,13 @@ Options: `--cart`, `--console`/`--adam`, `--headless`, `--frames N`, `--shots F1
 `--exp-ram 64|256|512|1024|2048|none` (memory expander, matching the OSD's Expansion RAM option),
 `--spin STEPS@FRAME[:N]` and `--spin2` (roller/spinner, matching the OSD's Spinner option),
 `--peek [v:]ADDR[:N]@FRAME` (print RAM bytes by Z80 address, `v:` for VRAM; console mode mirrors
-its 1K so 7038h is index 6038h), `--record FILE` and `--replay FILE`. Frames are saved as
-320×240 PPMs.
+its 1K so 7038h is index 6038h), `--printer FILE` (the raw bytes EOS sends AdamNet printer
+device 2; the ColEm harness in `compare/` takes the same option; add `--printer-baud N` to
+take them off the core's UART through a 16-byte FIFO, which holds the ADAM off), `--fujinet [PORT]`
+(FujiNet over a TCP socket, see below; `--fujinet-baud N`, `--fujinet-log FILE`, `--fujinet-verbose`,
+`--fujinet-nowait`, `--fujinet-config F`; `--fuji-disk FILE` swaps FujiNet-PC for a stand-in serving one
+disk, with `--fuji-latency MS`, `--fuji-drop-clr N` and `--fuji-enable-at MS`), `--no-media` (don't mount `adam.dsk`/`adam.ddp` from the current directory),
+`--record FILE` and `--replay FILE`. Frames are saved as 320×240 PPMs.
 
 `--record`/`--replay` are for faults somewhere a scripted `--press` cannot reach. Play the game
 in the GUI with `--record`, which writes one `frame bits` line per input change, then re-run the
@@ -126,6 +135,50 @@ Things to know:
   disturbed.
 - The simulator's per-drive pointers into the Verilated model (`sd_lba`, `sd_buff_din`) are
   set up in `sim_main.cpp`. Disks are drives 0-3 and tapes 4-7, so every drive needs its own.
+
+## FujiNet
+
+FujiNet-PC, the FujiNet firmware built as a Linux program, runs on the MiSTer's ARM as a set of
+AdamNet devices on `/dev/ttyS1` when the OSD's UART connection is **FujiNet** (mode 8). The core
+is the AdamNet *master* for those devices: `cv_adamnet` queues the DCB command, `cv_adamnet_master`
+runs the wire transaction through `cv_fuji_uart` at the UART speed Main reports, and the result is
+written back into the DCB as the master 6801 would. The ADAM boots FujiNet's CONFIG from its disk 1
+(device 4) whenever floppy 1 has no image mounted, mounts TNFS images from there, and network
+programs reach the Fuji gateway (device F) and the network devices (9, A).
+
+- Forwarded: printer 2, clock 3, disks 4-7 **without a local image**, network 9-A, gateway F.
+  Keyboard and tapes always stay in the core; a floppy with an image mounted stays local.
+- The wire protocol (byte format, status packet, block read/write, character devices) is
+  documented in `cv_adamnet_master.sv`'s header. The reference is "FujiNet Engineering Series:
+  Connecting an Emulator (ADAMEm) to FujiNet-PC" (2026, adamarchive.org, Manuals/ADAM Hardware),
+  whose ch. 5 and 8 are the master, and FujiNet's `lib/bus/adamnet/`.
+- Timing is the emulator bridge's, not the real bus's: 300 ms for an ACK, RECEIVE re-polled every
+  50 ms for up to 20 s while FujiNet fetches a block, 1 ms of silence before a command that follows
+  a reply. FujiNet-PC clears its input after every command it answers, and the MiSTer's tty hands
+  it bytes in chunks several ms apart, so two commands sent without a reply in between must be
+  spaced wider than that or the second is thrown away (the re-poll and the reset broadcast are).
+  After a reset the core sends MN_RESET to every FujiNet device, then probes the gateway for up to
+  8 s, so a daemon still starting is found by EOS's device scan. Main sends the UART mode after
+  the core has started (mode 0 first, then the saved one), so after a load the ADAM is held in
+  reset until a mode arrives (1.5 s at most), and entering or leaving FujiNet mode resets it for
+  1.5 ms (`ColecoAdam.sv`). A FujiNet disk answers a READ of a new block busy (9Bh) first, as
+  the local disks do: ADAM CP/M's read-ahead must not complete.
+- The companion repo is `../FujiNet_MiSTer`: `build-docker.sh ADAM` cross-builds it into
+  `dist/fujinet-adam/`, `config/fnconfig-adam.ini` is its config (`[Serial] port=/dev/ttyS1`, the
+  baud the launcher fills in), `scripts/uartmode.fujinet` is `/sbin/uartmode` with mode 8 picking
+  the build by `/tmp/CORENAME`, and `patches/0002-*` makes the firmware's serial path read the port
+  and baud from its config. Its `MULTI_PLATFORM.md` has the history and the multi-core plan.
+
+In the simulator the far end is a TCP socket instead of the tty: `--fujinet` listens on port
+65216, the native FujiNet-PC ADAM build connects to it (its default Bus-over-IP peer, the same way
+ADAMEm does), and the core's UART pins are bridged to the socket in `verilator/sim_fujinet.cpp`.
+`verilator/fujinet_test.sh OUTDIR [options]` runs the pair; a CONFIG boot takes about 600 frames.
+Without a daemon, `--fuji-disk FILE` puts the stand-in in `verilator/sim_fuji.h` behind the same
+pins: it serves one disk as device 4, with a set block latency and lost CLRs on request.
+`MULTI_PLATFORM.md` in the companion repo has the native build recipe (`build_host/` there holds
+one, with `run/fnconfig.ini` for the socket: `[BOIP] enabled=1`). In every FujiNet-PC config the
+dummy WiFi must be *enabled*: the socket channel refuses to connect without it, and on the MiSTer
+a TNFS mount stalls after resolving the host.
 
 ## Comparing against ColEm
 
