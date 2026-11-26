@@ -25,7 +25,7 @@ git.
 | `rtl/cv_printer_uart.sv` | Printer FIFO and 8N1 transmitter to the HPS UART, active when the OSD's UART connection is Printer (mode 7); `mister_printerd` in the peer `printeremulation` repo makes the PDF. `verilator/printer_tb/` tests it |
 | `rtl/track_loader_adam.sv` | Moves disk/tape blocks between AdamNet and the SD image |
 | `rtl/vdp18v/` | TMS9918A (SystemVerilog). `rtl/vdp18/` is the older VHDL |
-| `rtl/t80sv/` | Z80 used by both hardware and simulation: `t80sv_T80pa`, a SystemVerilog T80 shared with the SVI-328 core, passing every SingleStepTests/z80 case including bus cycle order and strobe positions (its `README.md`). `t80sv_fixes.patch` records the fixes on top of upstream |
+| `rtl/t80sv/` | Z80 used by both hardware and simulation: `t80sv_T80pa`, a SystemVerilog T80 shared with the SVI-328 core, passing every SingleStepTests/z80 case including bus cycle order and strobe positions (its `README.md`). Taken unmodified from RodimusFVC/Rodimus_Chips_MiSTer; the README names the commit |
 | `rtl/tv80/` | The previous Z80, still built when `CPU_TV80` is defined (`cv_console.sv`). `rtl/T80/` is unused. `TV80_REFRESH` is its only `ifdef` and is `define`d in `tv80_core.v` and `tv80e.v` themselves, not in the `.qsf` or the simulator Makefile: it went undefined in both build systems for years, which left the R register non-existent and `LD A,R` returning 0. Don't move it back into a build file |
 | `rtl/{bios,writer,eos}.hex` | OS-7 BIOS, SmartWriter, EOS. `verilator/rtl/` has identical copies for the simulator |
 | `verilator/` | Verilator simulator (see below) |
