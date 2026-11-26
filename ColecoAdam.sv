@@ -618,6 +618,21 @@ reg [5:0] cart_pages = 6'b0;
 //always @(posedge clk_sys) if(ioctl_download) cart_pages <= ioctl_addr[19:14];
 always @(posedge clk_sys) if(ioctl_wr) cart_pages <= ioctl_addr[19:14];
 
+// Opcode Super Game Cartridge (the "OCM" mapper): a paged image whose header is at offset 0
+// rather than in its last 16K page; see cv_cart_detect. Its flash chip writes the cartridge.
+wire       cart_ocm;
+wire       cart_wr;
+wire [7:0] cart_wd;
+cv_cart_detect cart_detect
+(
+   .clk_i(clk_sys),
+   .wr_i(ioctl_wr),
+   .addr_i(ioctl_addr),
+   .d_i(ioctl_dout),
+   .cart_pages_i(cart_pages),
+   .ocm_o(cart_ocm)
+);
+
 
 // Half a cycle of skew, which the controller's read timing depends on: see sdram.sv.
 assign SDRAM_CLK = ~clk_sys;
@@ -635,8 +650,8 @@ sdram sdram
    // ch0: the cartridge, and the ioctl download that fills it.
    .ch0_addr(ioctl_download ? ioctl_addr : {5'd0, cart_a}),
    .ch0_rd(cart_rd & ~ioctl_download),
-   .ch0_wr(ioctl_wr),
-   .ch0_din(ioctl_dout),
+   .ch0_wr(ioctl_download ? ioctl_wr : cart_wr),
+   .ch0_din(ioctl_download ? ioctl_dout : cart_wd),
    .ch0_dout(cart_d),
    // Was unconnected, so nothing waited for a read to complete; see cv_console's cart_wait_n.
    .ch0_ready(cart_ready),
@@ -839,6 +854,9 @@ cv_console
         .vram_d_i(vram_di),
 
         .cart_pages_i(cart_pages),
+        .cart_ocm_i(cart_ocm),
+        .cart_wr_o(cart_wr),
+        .cart_wd_o(cart_wd),
         .cart_a_o(cart_a),
         .cart_d_i(cart_d),
         .cart_rd(cart_rd),

@@ -18,6 +18,7 @@ git.
 | `ColecoAdam.qpf/.qsf`, `files.qip` | Quartus project; `releases/` holds built `.rbf` files |
 | `rtl/cv_console.sv` | Console: Z80 (t80sv), M1 WAIT flip-flop, bus mux, VDP, SN76489, AY, controllers, AdamNet |
 | `rtl/cv_addr_dec.sv` | Memory map (port 7Fh memory select, 3Fh EOS enable, 53h SGM RAM enable, MegaCart paging) and I/O decode |
+| `rtl/cv_cart_detect.sv`, `rtl/cv_ocm_flash.sv` | Opcode's Super Game Cartridge ("OCM" mapper): detected from the image (header at offset 0, not in the last 16K page), four 8K bank registers at FFFC-FFFF in `cv_addr_dec`, and the cartridge's JEDEC flash, where the games save scores and options (sector 1F000h). Saves last until the cartridge is reloaded |
 | `rtl/cv_ctrl.sv` | Controller ports: keypad/joystick select, the port read mux, and the spinner strobe and interrupt. `cv_ctrl.vhd` is the older VHDL, no longer built |
 | `rtl/cv_spinner.sv` | Turns a spinner device or an analog axis into the pin 7/9 signalling of Coleco's roller controllers |
 | `rtl/cv_adamnet.sv` | AdamNet devices and the PS/2 to ADAM key tables, and the FujiNet forwarding rule and job queue (see FujiNet below) |

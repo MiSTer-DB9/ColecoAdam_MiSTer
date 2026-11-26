@@ -365,6 +365,20 @@ wire        cart_rd;
 reg [5:0] cart_pages;
 always @(posedge clk_sys) if(ioctl_wr) cart_pages <= ioctl_addr[19:14];
 
+// Opcode Super Game Cartridge: header at offset 0 rather than in the last page (cv_cart_detect).
+wire       cart_ocm;
+wire       cart_wr;
+wire [7:0] cart_wd;
+cv_cart_detect cart_detect
+(
+        .clk_i(clk_sys),
+        .wr_i(ioctl_wr),
+        .addr_i(ioctl_addr),
+        .d_i(ioctl_dout),
+        .cart_pages_i(cart_pages),
+        .ocm_o(cart_ocm)
+);
+
 /*
 assign SDRAM_CLK = ~clk_sys;
 sdram sdram
@@ -386,8 +400,8 @@ spramv #(20) cart
 (
         .clock(clk_sys),
         .address(ioctl_download ? ioctl_addr : cart_a),
-        .wren(ioctl_wr),
-        .data(ioctl_dout),
+        .wren(ioctl_download ? ioctl_wr : cart_wr),   // cart_wr: the OCM cartridge's flash
+        .data(ioctl_download ? ioctl_dout : cart_wd),
         .enable(1'b1),
         .cs(1'b1),
         .q(cart_d)
@@ -675,6 +689,9 @@ wire  [7:0] ext_rom_d=8'hff;
      .vram_d_i(vram_di),
 
      .cart_pages_i(cart_pages),
+     .cart_ocm_i(cart_ocm),
+     .cart_wr_o(cart_wr),
+     .cart_wd_o(cart_wd),
      .cart_a_o(cart_a),
      .cart_d_i(cart_d),
      .cart_rd(cart_rd),

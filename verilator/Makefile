@@ -65,6 +65,8 @@ V_SRC = \
 	../rtl/cv_expander.sv \
 	../rtl/sdram.sv \
 	../rtl/cv_addr_dec.sv \
+	../rtl/cv_cart_detect.sv \
+	../rtl/cv_ocm_flash.sv \
 	../rtl/cv_console.sv \
 	../rtl/cv_fuji_pkg.sv \
 	../rtl/cv_adamnet_master.sv \
