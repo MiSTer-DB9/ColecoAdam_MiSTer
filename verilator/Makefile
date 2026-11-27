@@ -65,8 +65,14 @@ V_SRC = \
 	../rtl/cv_expander.sv \
 	../rtl/sdram.sv \
 	../rtl/cv_addr_dec.sv \
+	../rtl/cv_cart_detect.sv \
+	../rtl/cv_ocm_flash.sv \
 	../rtl/cv_console.sv \
+	../rtl/cv_fuji_pkg.sv \
+	../rtl/cv_adamnet_master.sv \
+	../rtl/cv_fuji_uart.sv \
 	../rtl/cv_adamnet.sv \
+	../rtl/cv_printer_uart.sv \
 	../rtl/cv_por.sv	 \
 	../rtl/vdp18v/vdp18_pkg.sv \
 	../rtl/vdp18v/vdp18_clk_gen.sv \
@@ -84,14 +90,15 @@ V_SRC = \
 	../rtl/sn76489/sn76489_noise.sv \
 	../rtl/sn76489/sn76489_tone.sv \
 	../rtl/sn76489/sn76489_top.sv \
-	$(RTL)/tv80/tv80_alu.v  $(RTL)/tv80/tv80_core.v  $(RTL)/tv80/tv80_mcode.v  $(RTL)/tv80/tv80_reg.v  $(RTL)/tv80/tv80e.v
+	$(RTL)/tv80/tv80_alu.v  $(RTL)/tv80/tv80_core.v  $(RTL)/tv80/tv80_mcode.v  $(RTL)/tv80/tv80_reg.v  $(RTL)/tv80/tv80e.v \
+	$(RTL)/t80sv/t80sv_all.sv
 
 
 
 #	AdamNet.c ColGlue.c  EMULib/FDIDisk.c sim_main.cpp
 C_SRC = \
         ColGlue.c  EMULib/FDIDisk.c \
-	sim_main.cpp  \
+	sim_main.cpp sim_fujinet.cpp \
 	sim/sim_bus.cpp sim/sim_blkdevice.cpp sim/sim_clock.cpp sim/sim_console.cpp sim/sim_video.cpp sim/sim_console.cpp sim/sim_input.cpp  sim/sim_audio.cpp \
 	sim/imgui/imgui_impl_sdl.cpp sim/imgui/imgui_impl_opengl2.cpp sim/imgui/imgui_draw.cpp sim/imgui/imgui_widgets.cpp sim/imgui/imgui_tables.cpp sim/imgui/imgui.cpp sim/imgui/ImGuiFileDialog.cpp sim/imgui/implot.cpp sim/imgui/implot_items.cpp
 

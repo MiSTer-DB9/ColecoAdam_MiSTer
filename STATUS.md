@@ -365,6 +365,77 @@ was ruled out correctly; the missing piece was upstream of all of it.
   are identical and Diablo's worst_fg improves 0.9611 to 0.9647; both SmartWRITER scenarios match
   in every metric, which is the AdamNet keyboard path the new refresh cycles would have disturbed.
 
+### FujiNet: the core as AdamNet master for FujiNet-PC (2026-11-07, branch `fujinet`)
+
+- **What:** with the OSD's UART connection set to FujiNet, the devices FujiNet-PC serves (printer 2,
+  clock 3, disks 4-7 without a local image, network 9-A, the Fuji gateway F) are no longer
+  emulated in `cv_adamnet`; their DCB commands go to `cv_adamnet_master`, which speaks the AdamNet
+  wire protocol to FujiNet-PC on the HPS over `cv_fuji_uart` and the HPS UART. The protocol and
+  its timing are from FujiNet's `lib/bus/adamnet/` and the 2026 ADAMEm Bus-over-IP guide
+  (`CLAUDE.md`, FujiNet section).
+- **Check:** in the simulator, with `verilator/fujinet_test.sh` against the native FujiNet-PC
+  ADAM build over a TCP socket: the reset broadcast, the gateway probe, EOS's device scan (every
+  status packet's checksum good), the double block read EOS does per block, and CONFIG's own
+  traffic to the gateway (host and device slot reads) all run, and CONFIG's HOST SLOTS screen is
+  up by frame 600 at 115,200 baud. A local disk still boots with FujiNet off, and no byte goes out.
+- **Also checked:** in CONFIG, selecting the fujinet.online host mounts it over TNFS (FujiNet-PC
+  reaches the real server from the Mac), and the directory listing (ADAM/, APPLE2/, ATARI/...)
+  comes up on the ADAM's screen: OPEN DIRECTORY is a 258 byte character write, each entry a
+  3 byte write and a 31 byte read, with the 7Fh end marker closing the list.
+- **Found on the way:** the job queue re-ran every finished command once (the DCB block clears
+  the pending bit a clock after the job sees it), which doubled each status request and, for the
+  boot block read, re-read block 0 under the boot loader and hung it. Masked in `fuji_waiting`.
+  And a STATUS must write the device's whole status byte into DCB+20, not just the low nibble
+  EOS reads as the media state: CONFIG reads the gateway's byte after a command (FujiNet sets
+  20h in it when the command failed), and with only the low nibble written CONFIG treated the host
+  mount as failed and went back to its host list.
+- **Result codes** are the master 6801's (programming guide, Appendix A): 83h SEND timeout, 88h
+  NACK, 89h RECEIVE timeout, 8Ch RECEIVE NACK (nothing to read), 8Dh CLR timeout, 93h STATUS
+  timeout, 9Bh otherwise. A character device that answers nothing is given up after 5 s, a block
+  device after 20 s (a TNFS fetch with retries).
+- **Hardware, 2026-11-08, mister192:** the first build (`docs/builds/ColecoAdam_fujinet_20261108.rbf`,
+  40% of ALMs, 214 RAM blocks, `clk_sys` slack +4.1 ns) booted to SmartWRITER with the daemon
+  running and nothing in its log. Three causes, found with the daemon stopped and
+  `cat /dev/ttyS1 | xxd` showing what the core sends:
+  1. Main sends the UART mode after the ADAM has already booted, so EOS's scan ran with FujiNet
+     off. The core now resets the ADAM when FujiNet mode comes or goes.
+  2. FujiNet-PC's serial path waited 2 ms for the rest of a packet; a Linux tty delivers bytes in
+     chunks several ms apart, so the 9 byte block request was NAKed every time and EOS retried it
+     forever. Patch 0002 waits 100 ms. With that, the daemon logged `BLOCK: 0 / DDP READ`.
+  3. The block never arrived: the daemon clears its input after each command it answers and
+     then discards whatever comes in the next 180 µs, meant for the one-wire bus's echo of its
+     own reply. On Linux its `tcdrain` returns late, in jiffies, so that window landed on the
+     core's next command and ate it: the RECEIVE re-poll, then the CLR. Patch 0002 sets the
+     serial path's discard to zero (a two-wire tty has no echo); the core's re-poll is 50 ms and
+     the reset broadcast's bytes 20 ms apart as well. The socket in the simulator answers in
+     microseconds, so none of this showed there.
+  With those, `docs/builds/ColecoAdam_fujinet_20261108b.rbf` (40% of ALMs, 214 RAM blocks,
+  `clk_sys` slack +5.2 ns) **boots CONFIG from a plain core load**: the daemon serves the 33
+  blocks, twice each, at about 100 ms a read, and CONFIG's HOST SLOTS screen is up in 10 s.
+  From there, fujinet.online mounts over TNFS, its directory lists, `ADAM/weather.ddp` mounts
+  into slot 1 and boots, and the program's HTTP request to ipstack goes out through network
+  device 9 and comes back parsed as JSON (five queries answered). Three FujiNet-PC fixes were
+  needed for that, found with the simulator and the native build (patch 0003 in the companion
+  repo): the ADAM's fujinet-lib puts a control byte before `N:` in an open spec, which the
+  firmware's stricter prefix check no longer tolerated; the next command then built a parser on
+  the missing protocol and aborted the daemon; and the unified network device reads one-byte
+  ADAM commands (set parser, HTTP channel mode) from SIO's second parameter slot, which an ADAM
+  packet does not have. A fourth: the PC daemon saved its config without `[Serial] baud` for
+  any platform but the CoCo, so after CONFIG's first save it came back at 57,600. Two more regressions made the forecast
+  fail and then come out wrong (a line feed in query values, a 256 byte cap on open specs);
+  with those fixed weather.ddp shows the San Francisco forecast. Only api.geotimezone.com
+  fails, its server refusing TLS to every client.
+  `HANDOFF.md` has the install as it stands on mister192.
+- **ADAM CP/M from FujiNet, 2026-11-09:** a tester of the 20261108 package sent fixes (`TODO.md`
+  0a): FujiNet disks answer a new block busy-first as the local ones do, a lost CLR is re-polled
+  instead of failing, and the ADAM is held in reset after a load until Main's UART mode arrives.
+  In the simulator CP/M 2.2 served from FujiNet-PC's SD host stopped with a blank screen after
+  the boot loader before them and reaches `A>` with them; with the new stand-in it reaches `A>`
+  at 300 ms a block, with every third CLR lost (eight recovered), and with the UART mode arriving
+  60 ms late. CONFIG still boots (34 block fetches, was 67) and weather.ddp shows its forecast.
+  The tester reports `A>` and `DIR` on their board, and CONFIG 5 of 5 loads from the menu.
+  `docs/builds/ColecoAdam_fujinet_20261109.rbf`: 40% of ALMs, `clk_sys` slack +4.75 ns.
+
 ## Still open
 - **System Hardware Test and ADAM Final Test 3.3 are not black after all** (checked 2026-09-18 in
   Computer mode, where an ADAM diagnostic belongs). Both run:

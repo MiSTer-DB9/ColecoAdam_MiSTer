@@ -54,7 +54,9 @@ module cv_addr_dec (
     input        [15:0] a_i,
     input        [ 7:0] d_i,
     input        [ 5:0] cart_pages_i,
-    output logic [ 5:0] cart_page_o,
+    input               ocm_i,          // Opcode Super Game Cartridge (cv_cart_detect)
+    output logic [ 6:0] cart_bank_o,    // 8K bank of the cartridge image; A12-A0 complete it
+    output logic        cart_wr_o,      // write cycle to the cartridge's flash (OCM only)
     input               iorq_n_i,
     input               rd_n_i,
     input               wr_n_i,
@@ -85,6 +87,10 @@ module cv_addr_dec (
 
   logic       megacart_en;
   logic [5:0] megacart_page;
+  logic [6:0] ocm_bank [4];
+  logic [6:0] ocm_mask;
+  logic       cart_space;     // 8000-FFFF is the cartridge in the current memory map
+  logic       ocm_reg_wr;
  // logic       bios_en;
   logic       eos_en;
   logic       last_35_reset_bit;
@@ -130,24 +136,31 @@ module cv_addr_dec (
     ctrl_en_joy_n_o = '1;
 
 
-    megacart_en = (cart_pages_i == 6'b000011 |
+    megacart_en = ~ocm_i &
+                  (cart_pages_i == 6'b000011 |
                    cart_pages_i == 6'b000111 |
                    cart_pages_i == 6'b001111 |
                    cart_pages_i == 6'b011111 |
                    cart_pages_i == 6'b111111);		// 1M
 
-    // Paging
-    case (a_i[15:14])
-      2'b10: begin
-        if (megacart_en) cart_page_o = cart_pages_i;
-        else cart_page_o = '0;
-      end
-      2'b11: begin
-        if (megacart_en) cart_page_o = megacart_page;
-        else cart_page_o = 6'b000001;
-      end
-      default: cart_page_o = 6'b000000;
-    endcase
+    // Paging, in 8K banks. MegaCart: the last 16K page fixed at 8000h and the page selected by
+    // a read of FFC0-FFFF at C000h. OCM: four 8K windows, each with its own register; the order
+    // is FBNeo's (d_coleco.cpp update_map), which the games' start-up code confirms - Mooncresta
+    // runs on from 8000h after writing FFFFh=00 and jumps into C000h after FFFDh=0Eh.
+    if (ocm_i) begin
+      case (a_i[14:13])
+        2'b00: cart_bank_o = ocm_bank[3];   // 8000-9FFF  FFFFh
+        2'b01: cart_bank_o = ocm_bank[0];   // A000-BFFF  FFFCh
+        2'b10: cart_bank_o = ocm_bank[1];   // C000-DFFF  FFFDh
+        2'b11: cart_bank_o = ocm_bank[2];   // E000-FFFF  FFFEh
+      endcase
+    end else begin
+      case (a_i[15:14])
+        2'b10: cart_bank_o = {megacart_en ? cart_pages_i : 6'b000000, a_i[13]};
+        2'b11: cart_bank_o = {megacart_en ? megacart_page : 6'b000001, a_i[13]};
+        default: cart_bank_o = {6'b000000, a_i[13]};
+      endcase
+    end
 
     // Memory access ----------------------------------------------------------
     if (~mreq_n_i && rfsh_n_i) begin
@@ -251,6 +264,26 @@ module cv_addr_dec (
 
   assign lower_mem = lower_mem_adam;
   assign upper_mem = upper_mem_adam;
+
+  // OCM: a write to FFFC-FFFF sets a bank register; any other write to the cartridge goes to its
+  // flash chip (cv_ocm_flash). The bank number is masked to the image, 8K banks.
+  assign cart_space = a_i[15] & (upper_mem == 2'b11);
+  assign ocm_reg_wr = ocm_i & cart_space & ~mreq_n_i & rfsh_n_i & ~wr_n_i & (a_i[15:2] == 14'h3FFF);
+  assign cart_wr_o  = ocm_i & cart_space & ~mreq_n_i & rfsh_n_i & ~wr_n_i & (a_i[15:2] != 14'h3FFF);
+  assign ocm_mask   = {cart_pages_i, 1'b1};
+
+  always @(negedge reset_n_i, posedge clk_i) begin : ocm_regs
+    if (~reset_n_i) begin
+      // FBNeo's reset values. Only bank 0 at 8000h matters: it holds the header and the start-up
+      // code, which sets all four registers before it leaves 8000-801Fh.
+      ocm_bank[0] <= 7'd3;
+      ocm_bank[1] <= 7'd2;
+      ocm_bank[2] <= 7'd1;
+      ocm_bank[3] <= 7'd0;
+    end else if (ocm_reg_wr) begin
+      ocm_bank[a_i[1:0]] <= d_i[6:0] & ocm_mask;
+    end
+  end
 
   always @(negedge reset_n_i, posedge clk_i) begin : megacart
     if (~reset_n_i) begin
