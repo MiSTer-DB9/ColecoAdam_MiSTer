@@ -84,6 +84,22 @@ module emu
    output [15:0]         AUDIO_L,
    output [15:0]         AUDIO_R,
 
+   // AdamNet printer bytes, one per PRN_STROBE clock (--printer writes them to a file)
+   output [7:0]          PRN_DATA,
+   output                PRN_STROBE,
+   // --printer-baud: the same bytes through the hardware's FIFO and UART, which then
+   // hold the ADAM off whenever the FIFO fills. 0 leaves the UART off and ready high.
+   input [31:0]          prn_baud,
+   output                PRN_TXD,
+   output                PRN_READY,
+   // --fujinet: the AdamNet wire to FujiNet-PC, through the core's UART at fuji_baud.
+   // 0 leaves FujiNet off and every device emulated here.
+   input [31:0]          fuji_baud,
+   output                FUJI_TXD,
+   input                 FUJI_RXD,
+   input                 fuji_boot_cfg_req,  // --fujinet-config: the OSD's "FujiNet: boot CONFIG"
+   input                 fuji_boot_hold_en,  // --fuji-enable-at: model ColecoAdam.sv's hold for Main's UART mode
+
    input                 ioctl_download,
    input                 ioctl_wr,
    input [24:0]          ioctl_addr,
@@ -349,6 +365,20 @@ wire        cart_rd;
 reg [5:0] cart_pages;
 always @(posedge clk_sys) if(ioctl_wr) cart_pages <= ioctl_addr[19:14];
 
+// Opcode Super Game Cartridge: header at offset 0 rather than in the last page (cv_cart_detect).
+wire       cart_ocm;
+wire       cart_wr;
+wire [7:0] cart_wd;
+cv_cart_detect cart_detect
+(
+        .clk_i(clk_sys),
+        .wr_i(ioctl_wr),
+        .addr_i(ioctl_addr),
+        .d_i(ioctl_dout),
+        .cart_pages_i(cart_pages),
+        .ocm_o(cart_ocm)
+);
+
 /*
 assign SDRAM_CLK = ~clk_sys;
 sdram sdram
@@ -370,8 +400,8 @@ spramv #(20) cart
 (
         .clock(clk_sys),
         .address(ioctl_download ? ioctl_addr : cart_a),
-        .wren(ioctl_wr),
-        .data(ioctl_dout),
+        .wren(ioctl_download ? ioctl_wr : cart_wr),   // cart_wr: the OCM cartridge's flash
+        .data(ioctl_download ? ioctl_dout : cart_wd),
         .enable(1'b1),
         .cs(1'b1),
         .q(cart_d)
@@ -498,18 +528,84 @@ wire  [7:0] ext_rom_d=8'hff;
      else if (soft_reset) game_reset <= 0;
   end
 
+  // The sim clock is the 10.7 MHz rate itself. A 16 byte FIFO, not the hardware's
+  // 512, so an ordinary SmartWriter print fills it and exercises the hold-off.
+  wire prn_ready;
+  assign PRN_READY = prn_ready;
+  cv_printer_uart #(.CLK_HZ(10_738_635), .FIFO_AW(4)) printer_uart
+  (
+     .clk(clk_sys),
+     .reset(1'b0),
+     .enable(prn_baud != 0),
+     .baud(prn_baud),
+     .din(PRN_DATA),
+     .wr(PRN_STROBE),
+     .ready(prn_ready),
+     .txd(PRN_TXD)
+  );
+
+  // FujiNet link, as in ColecoAdam.sv but at the sim's clock rate
+  wire       fuji_en = (fuji_baud != 0);
+  wire       fuji_boot_cfg_ack;
+  reg        fuji_boot_cfg = 0;
+  always @(posedge clk_sys) begin
+     if (fuji_boot_cfg_req && fuji_en) fuji_boot_cfg <= 1;
+     else if (fuji_boot_cfg_ack || !fuji_en) fuji_boot_cfg <= 0;
+  end
+  // Entering or leaving FujiNet mode resets the ADAM for 64K clocks, and after a load the ADAM is
+  // held in reset until the UART mode arrives (1.5 s at most), as in ColecoAdam.sv. The hold is
+  // only modelled when --fuji-enable-at asks for it, so other runs start as they always have.
+  reg old_fuji_en = 0;
+  always @(posedge clk_sys) old_fuji_en <= fuji_en;
+  reg [15:0] fuji_rst_cnt = 0;
+  always @(posedge clk_sys) begin
+     if (old_fuji_en != fuji_en) fuji_rst_cnt <= 16'hFFFF;
+     else if (fuji_rst_cnt != 0) fuji_rst_cnt <= fuji_rst_cnt - 1'd1;
+  end
+  reg        boot_hold_done = 0;
+  reg [24:0] boot_hold = 0;
+  always @(posedge clk_sys) begin
+     if (!boot_hold_done) begin boot_hold_done <= 1; boot_hold <= fuji_boot_hold_en ? 25'd16_000_000 : 25'd0; end
+     else if (fuji_en) boot_hold <= 0;
+     else if (boot_hold != 0) boot_hold <= boot_hold - 1'd1;
+  end
+  wire console_reset = reset | (old_fuji_en != fuji_en) | (fuji_rst_cnt != 0) | (boot_hold != 0);
+
+  wire [7:0] fuji_tx_data;
+  wire       fuji_tx_wr, fuji_tx_busy;
+  wire [7:0] fuji_rx_data;
+  wire       fuji_rx_avail, fuji_rx_rd, fuji_rx_flush;
+  cv_fuji_uart #(.CLK_HZ(10_738_635)) fuji_uart
+  (
+     .clk(clk_sys),
+     .reset(1'b0),
+     .enable(fuji_en),
+     .baud(fuji_baud),
+     .tx_data(fuji_tx_data),
+     .tx_wr(fuji_tx_wr),
+     .tx_busy(fuji_tx_busy),
+     .rx_data(fuji_rx_data),
+     .rx_avail(fuji_rx_avail),
+     .rx_rd(fuji_rx_rd),
+     .rx_flush(fuji_rx_flush),
+     .rx_err(),
+     .txd(FUJI_TXD),
+     .rxd(FUJI_RXD)
+  );
+
   cv_console
     #
     (
      .NUM_DISKS (NUM_DISKS),
      .NUM_TAPES (NUM_TAPES),
-     .USE_REQ   (USE_REQ)
+     .USE_REQ   (USE_REQ),
+     .CLK_HZ    (10_738_635)
      )
   console
     (
      .clk_i(clk_sys),
      .clk_en_10m7_i(ce_10m7),
-     .reset_n_i(~reset),
+     .reset_n_i(~console_reset),
      .por_n_o(),
      //.sg1000(sg1000),
      //.dahjeeA_i(extram),
@@ -572,12 +668,30 @@ wire  [7:0] ext_rom_d=8'hff;
      .ramb_wr_ack(ramb_wr_ack),
      .ramb_rd_ack(ramb_rd_ack),
 
+     .prn_data(PRN_DATA),
+     .prn_strobe(PRN_STROBE),
+     .prn_ready(prn_ready),
+
+     .fuji_en(fuji_en),
+     .fuji_boot_cfg(fuji_boot_cfg),
+     .fuji_boot_cfg_ack(fuji_boot_cfg_ack),
+     .fuji_tx_data(fuji_tx_data),
+     .fuji_tx_wr(fuji_tx_wr),
+     .fuji_tx_busy(fuji_tx_busy),
+     .fuji_rx_data(fuji_rx_data),
+     .fuji_rx_avail(fuji_rx_avail),
+     .fuji_rx_rd(fuji_rx_rd),
+     .fuji_rx_flush(fuji_rx_flush),
+
      .vram_a_o(vram_a),
      .vram_we_o(vram_we),
      .vram_d_o(vram_do),
      .vram_d_i(vram_di),
 
      .cart_pages_i(cart_pages),
+     .cart_ocm_i(cart_ocm),
+     .cart_wr_o(cart_wr),
+     .cart_wd_o(cart_wd),
      .cart_a_o(cart_a),
      .cart_d_i(cart_d),
      .cart_rd(cart_rd),

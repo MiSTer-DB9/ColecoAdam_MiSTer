@@ -33,8 +33,9 @@ module tv80_mcode
   LDW, LDSPHL, Special_LD, ExchangeDH, ExchangeRp, ExchangeAF, 
   ExchangeRS, I_DJNZ, I_CPL, I_CCF, I_SCF, I_RETN, I_BT, I_BC, I_BTR, 
   I_RLD, I_RRD, I_INRC, SetDI, SetEI, IMode, Halt, NoRead, Write, 
+  XYbit_undoc, Save_TmpL,
   // Inputs
-  IR, ISet, MCycle, F, NMICycle, IntCycle
+  IR, ISet, MCycle, F, NMICycle, IntCycle, XY_State
   );
   
   parameter             Mode   = 0;
@@ -48,6 +49,9 @@ module tv80_mcode
   parameter             Flag_S = 7;
 
   input [7:0]           IR;
+  input [1:0]           XY_State;  // DD/FD prefix active (DDCB/FDCB register-copy forms)
+  output                XYbit_undoc;  // DDCB/FDCB with op&7 != 6: result to (IX+d) and to the register
+  output                Save_TmpL;    // register write takes TmpAddr[7:0] (EX (SP),HL)
   input [1:0]           ISet                    ;
   input [6:0]           MCycle                  ;
   input [7:0]           F                       ;
@@ -147,6 +151,8 @@ module tv80_mcode
   reg                   Halt                    ;
   reg                   NoRead                  ;
   reg                   Write   ;                
+  reg                   XYbit_undoc;
+  reg                   Save_TmpL;
 
   parameter             aNone   = 3'b111;
   parameter             aBC     = 3'b000;
@@ -202,7 +208,7 @@ module tv80_mcode
   reg [1:0] DPAIR;
   
   always @ (/*AUTOSENSE*/F or IR or ISet or IntCycle or MCycle
-            or NMICycle)
+            or NMICycle or XY_State)
     begin
       DDD = IR[5:3];
       SSS = IR[2:0];
@@ -261,6 +267,8 @@ module tv80_mcode
       Halt = 1'b0;
       NoRead = 1'b0;
       Write = 1'b0;
+      XYbit_undoc = 1'b0;
+      Save_TmpL = 1'b0;
       
       case (ISet)
         2'b00  :
@@ -801,37 +809,41 @@ module tv80_mcode
                 begin
                   if (Mode != 3 ) 
                     begin
-                      // EX (SP),HL
+                      // EX (SP),HL: MR (SP), MR (SP+1), MW (SP+1)=H, MW (SP)=L, 4/3/4/3/5 T
+                      // (UM0080 EX (SP),HL; bus order as SingleStepTests). (SP) is held in
+                      // TmpAddr[7:0] until L has been written out.
                       MCycles = 3'b101;
                       case (1'b1) // MCycle
                         MCycle[0] :
                           Set_Addr_To = aSP;
                         MCycle[1] :
                           begin
-                            Read_To_Reg = 1'b1;
-                            Set_BusA_To = 4'b0101;
-                            Set_BusB_To = 4'b0101;
+                            LDZ = 1'b1;              // TmpAddr[7:0] <= (SP)
+                            IncDec_16 = 4'b0111;     // SP+1
                             Set_Addr_To = aSP;
                           end
                         MCycle[2] :
                           begin
-                            IncDec_16 = 4'b0111;
+                            Read_To_Reg = 1'b1;      // H <= (SP+1); BusB keeps the old H
+                            Set_BusA_To = 4'b0100;
+                            Set_BusB_To = 4'b0100;
                             Set_Addr_To = aSP;
                             TStates = 3'b100;
-                            Write = 1'b1;
                           end
                         MCycle[3] :
                           begin
-                            Read_To_Reg = 1'b1;
-                            Set_BusA_To = 4'b0100;
-                            Set_BusB_To = 4'b0100;
+                            Write = 1'b1;            // (SP+1) <= old H
+                            Set_BusB_To = 4'b0101;   // old L for the next write
+                            IncDec_16 = 4'b1111;     // SP back
                             Set_Addr_To = aSP;
                           end
                         MCycle[4] :
                           begin
-                            IncDec_16 = 4'b1111;
+                            Write = 1'b1;            // (SP) <= old L
                             TStates = 3'b101;
-                            Write = 1'b1;
+                            Read_To_Reg = 1'b1;      // L <= TmpAddr[7:0]
+                            Set_BusA_To = 4'b0101;
+                            Save_TmpL = 1'b1;
                           end
                         
                         default :;
@@ -1021,8 +1033,7 @@ module tv80_mcode
                         
                         MCycle[1] :
                           begin
-                            TStates = 3'b100;
-                            Write = 1'b1;
+                            Write = 1'b1;   // stack writes are 3 T (UM0080 NMI/INT timing; as T80)
                             IncDec_16 = 4'b1111;
                             Set_Addr_To = aSP;
                             Set_BusB_To = 4'b1100;
@@ -1030,7 +1041,6 @@ module tv80_mcode
                         
                         MCycle[2] :
                           begin
-                            TStates = 3'b100;
                             Write = 1'b1;
                           end
                         
@@ -1054,8 +1064,7 @@ module tv80_mcode
                         
                         MCycle[1] :
                           begin
-                            TStates = 3'b100;
-                            Write = 1'b1;
+                            Write = 1'b1;   // stack writes are 3 T (UM0080 NMI/INT timing; as T80)
                             IncDec_16 = 4'b1111;
                             Set_Addr_To = aSP;
                             Set_BusB_To = 4'b1100;
@@ -1063,7 +1072,6 @@ module tv80_mcode
                         
                         MCycle[2] :
                           begin
-                            TStates = 3'b100;
                             Write = 1'b1;
                           end
                         
@@ -1791,10 +1799,31 @@ module tv80_mcode
                   // SRA r
                   // SRL r
                   // SLL r (Undocumented) / SWAP r
-                  if (MCycle[0] ) begin
-                    ALU_Op = 4'b1000;
-                    Read_To_Reg = 1'b1;
-                    Save_ALU = 1'b1;
+                  if (XY_State == 2'b00) begin
+                    if (MCycle[0] ) begin
+                      ALU_Op = 4'b1000;
+                      Read_To_Reg = 1'b1;
+                      Save_ALU = 1'b1;
+                    end
+                  end else begin
+                    // rot (IX+d),r (undocumented, as T80): result written to (IX+d) and r
+                      MCycles = 3'b011;
+                      XYbit_undoc = 1'b1;
+                      case (1'b1) // MCycle
+                        MCycle[0], MCycle[6] :
+                          Set_Addr_To = aXY;
+                        MCycle[1] :
+                          begin
+                            ALU_Op = 4'b1000;
+                            Read_To_Reg = 1'b1;
+                            Save_ALU = 1'b1;
+                            Set_Addr_To = aXY;
+                            TStates = 3'b100;
+                          end
+                        MCycle[2] :
+                          Write = 1'b1;
+                        default :;
+                      endcase
                   end
                 end // case: 8'b00000000,8'b00000001,8'b00000010,8'b00000011,8'b00000100,8'b00000101,8'b00000111,...
               
@@ -1837,11 +1866,27 @@ module tv80_mcode
                   8'b01111000,8'b01111001,8'b01111010,8'b01111011,8'b01111100,8'b01111101,8'b01111111 :
                     begin
                       // BIT b,r
+                      if (XY_State == 2'b00) begin
                       if (MCycle[0] )
                         begin
                           Set_BusB_To[2:0] = IR[2:0];
                           ALU_Op = 4'b1001;
                         end
+                      end else begin
+                      // BIT b,(IX+d) (undocumented encodings, as T80)
+                          MCycles = 3'b010;
+                          XYbit_undoc = 1'b1;
+                          case (1'b1) // MCycle
+                            MCycle[0], MCycle[6] :
+                              Set_Addr_To = aXY;
+                            MCycle[1] :
+                              begin
+                                ALU_Op = 4'b1001;
+                                TStates = 3'b100;
+                              end
+                            default :;
+                          endcase
+                      end
                     end // case: 8'b01000000,8'b01000001,8'b01000010,8'b01000011,8'b01000100,8'b01000101,8'b01000111,...
               
               8'b01000110,8'b01001110,8'b01010110,8'b01011110,8'b01100110,8'b01101110,8'b01110110,8'b01111110  :
@@ -1871,12 +1916,33 @@ module tv80_mcode
                   8'b11111000,8'b11111001,8'b11111010,8'b11111011,8'b11111100,8'b11111101,8'b11111111 :
                     begin
                       // SET b,r
+                      if (XY_State == 2'b00) begin
                       if (MCycle[0] ) 
                         begin
                           ALU_Op = 4'b1010;
                           Read_To_Reg = 1'b1;
                           Save_ALU = 1'b1;
                         end
+                      end else begin
+                      // SET b,(IX+d),r (undocumented, as T80): result written to (IX+d) and r
+                          MCycles = 3'b011;
+                          XYbit_undoc = 1'b1;
+                          case (1'b1) // MCycle
+                            MCycle[0], MCycle[6] :
+                              Set_Addr_To = aXY;
+                            MCycle[1] :
+                              begin
+                                ALU_Op = 4'b1010;
+                                Read_To_Reg = 1'b1;
+                                Save_ALU = 1'b1;
+                                Set_Addr_To = aXY;
+                                TStates = 3'b100;
+                              end
+                            MCycle[2] :
+                              Write = 1'b1;
+                            default :;
+                          endcase
+                      end
                     end // case: 8'b11000000,8'b11000001,8'b11000010,8'b11000011,8'b11000100,8'b11000101,8'b11000111,...
               
               8'b11000110,8'b11001110,8'b11010110,8'b11011110,8'b11100110,8'b11101110,8'b11110110,8'b11111110  :
@@ -1910,12 +1976,33 @@ module tv80_mcode
                   8'b10111000,8'b10111001,8'b10111010,8'b10111011,8'b10111100,8'b10111101,8'b10111111 :
                     begin
                       // RES b,r
+                      if (XY_State == 2'b00) begin
                       if (MCycle[0] ) 
                         begin
                           ALU_Op = 4'b1011;
                           Read_To_Reg = 1'b1;
                           Save_ALU = 1'b1;
                         end
+                      end else begin
+                      // RES b,(IX+d),r (undocumented, as T80): result written to (IX+d) and r
+                          MCycles = 3'b011;
+                          XYbit_undoc = 1'b1;
+                          case (1'b1) // MCycle
+                            MCycle[0], MCycle[6] :
+                              Set_Addr_To = aXY;
+                            MCycle[1] :
+                              begin
+                                ALU_Op = 4'b1011;
+                                Read_To_Reg = 1'b1;
+                                Save_ALU = 1'b1;
+                                Set_Addr_To = aXY;
+                                TStates = 3'b100;
+                              end
+                            MCycle[2] :
+                              Write = 1'b1;
+                            default :;
+                          endcase
+                      end
                     end // case: 8'b10000000,8'b10000001,8'b10000010,8'b10000011,8'b10000100,8'b10000101,8'b10000111,...
               
               8'b10000110,8'b10001110,8'b10010110,8'b10011110,8'b10100110,8'b10101110,8'b10110110,8'b10111110  :
@@ -2244,7 +2331,7 @@ module tv80_mcode
                 // IM 1
                 IMode = 2'b01;
               
-              8'b01011110,8'b01110111  :
+              8'b01011110,8'b01111110  :  // ED 5E, ED 7E (undocumented duplicate; ED 77 is a NOP, Young 3.4)
                 // IM 2
                 IMode = 2'b10;
               
@@ -2341,60 +2428,58 @@ module tv80_mcode
               
               8'b01101111  :
                 begin
-                  // RLD
+                  // RLD: MR (HL) in M2, 4 internal T, MW (HL) in M4 (UM0080 RLD: M cycles 4,
+                  // 4/4/3/4/3 T; Sorgelig's T80 fix "Read in M2, not M3!"). Was an extra read at PC.
                   MCycles = 3'b100;
                   case (1'b1) // MCycle
+                    MCycle[0] :
+                      Set_Addr_To = aXY;
                     MCycle[1] :
-                      begin
-                        NoRead = 1'b1;
-                        Set_Addr_To = aXY;
-                      end
-                    
-                    MCycle[2] :
                       begin
                         Read_To_Reg = 1'b1;
                         Set_BusB_To[2:0] = 3'b110;
                         Set_BusA_To[2:0] = 3'b111;
                         ALU_Op = 4'b1101;
-                        TStates = 3'b100;
-                        Set_Addr_To = aXY;
                         Save_ALU = 1'b1;
                       end
-                    
-                    MCycle[3] :
+                    MCycle[2] :
                       begin
+                        TStates = 3'b100;
                         I_RLD = 1'b1;
-                        Write = 1'b1;
+                        NoRead = 1'b1;
+                        Set_Addr_To = aXY;
                       end
-                    
+                    MCycle[3] :
+                      Write = 1'b1;
                     default :;
                   endcase // case(MCycle)
                 end // case: 8'b01101111
               
               8'b01100111  :
                 begin
-                  // RRD
+                  // RRD: MR (HL) in M2, 4 internal T, MW (HL) in M4 (UM0080 RRD: M cycles 4,
+                  // 4/4/3/4/3 T; Sorgelig's T80 fix "Read in M2, not M3!"). Was an extra read at PC.
                   MCycles = 3'b100;
                   case (1'b1) // MCycle
-                    MCycle[1] :
+                    MCycle[0] :
                       Set_Addr_To = aXY;
-                    MCycle[2] :
+                    MCycle[1] :
                       begin
                         Read_To_Reg = 1'b1;
                         Set_BusB_To[2:0] = 3'b110;
                         Set_BusA_To[2:0] = 3'b111;
                         ALU_Op = 4'b1110;
-                        TStates = 3'b100;
-                        Set_Addr_To = aXY;
                         Save_ALU = 1'b1;
                       end
-                    
-                    MCycle[3] :
+                    MCycle[2] :
                       begin
+                        TStates = 3'b100;
                         I_RRD = 1'b1;
-                        Write = 1'b1;
+                        NoRead = 1'b1;
+                        Set_Addr_To = aXY;
                       end
-                    
+                    MCycle[3] :
+                      Write = 1'b1;
                     default :;
                   endcase // case(MCycle)
                 end // case: 8'b01100111
@@ -2476,17 +2561,19 @@ module tv80_mcode
               
               8'b10100010 , 8'b10101010 , 8'b10110010 , 8'b10111010  :
                 begin
-                  // INI, IND, INIR, INDR
+                  // INI, IND, INIR, INDR: 4/5/4/3 T, IN in M3 (UM0080 INI; as T80)
                   MCycles = 3'b100;
                   case (1'b1) // MCycle
                     MCycle[0] :
                       begin
+                        TStates = 3'b101;
                         Set_Addr_To = aBC;
                         Set_BusB_To = 4'b1010;
                         Set_BusA_To = 4'b0000;
                         Read_To_Reg = 1'b1;
                         Save_ALU = 1'b1;
                         ALU_Op = 4'b0010;
+                        IncDec_16[3] = IR[3];   // ID16 = BC+-1 for the flags (as T80)
                       end
                     
                     MCycle[1] :
@@ -2499,17 +2586,12 @@ module tv80_mcode
                     MCycle[2] :
                       begin
                         if (IR[3] == 1'b0 ) 
-                          begin
-			    IncDec_16 = 4'b0110;
-                          end 
+                          IncDec_16 = 4'b0110;
                         else 
-                          begin
-			    IncDec_16 = 4'b1110;
-                          end
-                        TStates = 3'b100;
+                          IncDec_16 = 4'b1110;
                         Write = 1'b1;
                         I_BTR = 1'b1;
-                      end // case: 3
+                      end
                     
                     MCycle[3] :
                       begin
@@ -2523,7 +2605,7 @@ module tv80_mcode
               
               8'b10100011 , 8'b10101011 , 8'b10110011 , 8'b10111011  :
                 begin
-                  // OUTI, OUTD, OTIR, OTDR
+                  // OUTI, OUTD, OTIR, OTDR: 4/5/3/4 T, HL stepped in M3 (UM0080 OUTI; as T80)
                   MCycles = 3'b100;
                   case (1'b1) // MCycle
                     MCycle[0] :
@@ -2541,30 +2623,19 @@ module tv80_mcode
                       begin
                         Set_BusB_To = 4'b0110;
                         Set_Addr_To = aBC;
-                        if (IR[3] == 1'b0 ) 
-                          begin
-                            IncDec_16 = 4'b0110;
-                          end 
-                        else 
-                          begin
-                            IncDec_16 = 4'b1110;
-                          end
+                        IncDec_16[3] = IR[3];
                       end
                     
                     MCycle[2] :
                       begin
                         if (IR[3] == 1'b0 ) 
-                          begin
-                            IncDec_16 = 4'b0010;
-                          end 
+                          IncDec_16 = 4'b0110;
                         else 
-                          begin
-                            IncDec_16 = 4'b1010;
-                          end
+                          IncDec_16 = 4'b1110;
                         IORQ = 1'b1;
                         Write = 1'b1;
                         I_BTR = 1'b1;
-                      end // case: 3
+                      end
                     
                     MCycle[3] :
                       begin

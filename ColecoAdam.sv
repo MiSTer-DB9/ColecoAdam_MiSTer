@@ -264,7 +264,7 @@ joydb joydb (
 
 assign USER_OUT = USER_OUT_DRIVE;
 // [MiSTer-DB9 END]
-assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
 
@@ -295,7 +295,7 @@ video_freak video_freak
 
 `include "build_id.v"
 parameter CONF_STR = {
-        "Adam;;",
+        "Adam;UART115200:57600:38400:19200:9600;",
         "-;",
         "F,COLBINROM,Load CART;",
         "S0,DSK,Load Floppy 1;",
@@ -326,6 +326,9 @@ parameter CONF_STR = {
         // zeroed status word still means the expander the core has always defaulted to.
         "OHJ,Expansion RAM,64K,256K,512K,1M,2M,None;",
         "R0,Reset;",
+        // FujiNet keeps whatever CONFIG last mounted in its slot 1 until the daemon
+        // restarts; this asks it for CONFIG again and resets the ADAM into it.
+        "RK,FujiNet: boot CONFIG;",
         "J,Fire 1,Fire 2,*,#,0,1,2,3,4,5,6,7,8,9,Purple Tr,Blue Tr;",
         "V,v",`BUILD_DATE
 };
@@ -395,10 +398,16 @@ wire [15:0] joy1_l_analog, joy1_r_analog;
 
 wire  [8:0] spinner_0, spinner_1;
 
+wire  [7:0] uart_mode;
+wire [31:0] uart_speed;
+
 hps_io #(.CONF_STR(CONF_STR), .VDNUM(TOT_DISKS)) hps_io
 (
    .clk_sys(clk_sys),
    .HPS_BUS(HPS_BUS),
+
+   .uart_mode(uart_mode),
+   .uart_speed(uart_speed),
 
    .buttons(buttons),
    .status(status),
@@ -462,14 +471,51 @@ always @(posedge clk_sys) begin
         old_mode <= mode ;
 end
 
-wire reset = RESET | status[0] | buttons[1] | old_mode != mode | ioctl_download;
+// FujiNet (UART connection mode 8, see the UART section below). Main sends the mode a moment
+// after the core has booted, and the ADAM only looks for boot devices at reset, so entering or
+// leaving FujiNet mode resets the ADAM the way a Mode change does: the first boot in FujiNet
+// mode then finds FujiNet's disk 1, and leaving it drops the devices that are no longer there.
+wire fuji_en = (uart_mode == 8'd8) && (uart_speed != 0);
+reg  old_fuji_en = 0;
+always @(posedge clk_sys) old_fuji_en <= fuji_en;
+
+// Held for 1.5 ms (64K clocks) rather than one clock, so that every part of the ADAM sees it:
+// the Z80 runs on a 3.58 MHz enable.
+reg [15:0] fuji_rst_cnt = 0;
+always @(posedge clk_sys) begin
+        if (old_fuji_en != fuji_en) fuji_rst_cnt <= 16'hFFFF;
+        else if (fuji_rst_cnt != 0) fuji_rst_cnt <= fuji_rst_cnt - 1'd1;
+end
+wire fuji_rst = (old_fuji_en != fuji_en) || (fuji_rst_cnt != 0);
+
+// Hold the ADAM in reset after the core loads until Main has set a UART mode, or for 1.5 s if
+// the mode stays None, so the ADAM boots once, in the mode it will run in. Main sends mode 0
+// first, runs "uartmode 0", and only then sends the saved mode; when that is FujiNet, the reset
+// above used to land a few ms into EOS's start, and EOS came back without scanning for devices,
+// never showed a picture and never spoke to FujiNet (a black screen, loaded from the menu).
+reg [25:0] boot_hold = 26'd64_000_000;
+always @(posedge clk_sys) begin
+        if (uart_mode != 0 && uart_speed != 0) boot_hold <= 0;
+        else if (boot_hold != 0) boot_hold <= boot_hold - 1'd1;
+end
+
+// OSD "FujiNet: boot CONFIG" (status[20], a momentary R option): reset the ADAM and hold the
+// request across the reset until cv_adamnet has had the daemon put CONFIG back in slot 1.
+wire fuji_boot_cfg_ack;
+reg  fuji_boot_cfg = 0;
+always @(posedge clk_sys) begin
+        if (status[20] && fuji_en) fuji_boot_cfg <= 1;
+        else if (fuji_boot_cfg_ack || !fuji_en) fuji_boot_cfg <= 0;
+end
+
+wire reset = RESET | status[0] | status[20] | buttons[1] | old_mode != mode | ioctl_download | fuji_rst | (boot_hold != 0);
 
 // Loading a cartridge in Computer mode acts as the ADAM's cartridge reset switch: it starts with
 // OS-7, 24K of RAM and the cartridge (ADAM Technical Manual 2.6). Reset returns to SmartWRITER.
 reg game_reset = 0;
 always @(posedge clk_sys) begin
         if (ioctl_download && ioctl_index[5:0] == 1) game_reset <= 1;
-        else if (RESET | status[0] | buttons[1] | old_mode != mode) game_reset <= 0;
+        else if (RESET | status[0] | status[20] | buttons[1] | old_mode != mode | fuji_rst) game_reset <= 0;
 end
 
 /////////////////  Memory  ////////////////////////
@@ -668,6 +714,21 @@ reg [5:0] cart_pages = 6'b0;
 //always @(posedge clk_sys) if(ioctl_download) cart_pages <= ioctl_addr[19:14];
 always @(posedge clk_sys) if(ioctl_wr) cart_pages <= ioctl_addr[19:14];
 
+// Opcode Super Game Cartridge (the "OCM" mapper): a paged image whose header is at offset 0
+// rather than in its last 16K page; see cv_cart_detect. Its flash chip writes the cartridge.
+wire       cart_ocm;
+wire       cart_wr;
+wire [7:0] cart_wd;
+cv_cart_detect cart_detect
+(
+   .clk_i(clk_sys),
+   .wr_i(ioctl_wr),
+   .addr_i(ioctl_addr),
+   .d_i(ioctl_dout),
+   .cart_pages_i(cart_pages),
+   .ocm_o(cart_ocm)
+);
+
 
 // Half a cycle of skew, which the controller's read timing depends on: see sdram.sv.
 assign SDRAM_CLK = ~clk_sys;
@@ -685,8 +746,8 @@ sdram sdram
    // ch0: the cartridge, and the ioctl download that fills it.
    .ch0_addr(ioctl_download ? ioctl_addr : {5'd0, cart_a}),
    .ch0_rd(cart_rd & ~ioctl_download),
-   .ch0_wr(ioctl_wr),
-   .ch0_din(ioctl_dout),
+   .ch0_wr(ioctl_download ? ioctl_wr : cart_wr),
+   .ch0_din(ioctl_download ? ioctl_dout : cart_wd),
    .ch0_dout(cart_d),
    // Was unconnected, so nothing waited for a read to complete; see cv_console's cart_wait_n.
    .ch0_ready(cart_ready),
@@ -744,6 +805,59 @@ wire mode=~status[12];
   logic [TOT_DISKS-1:0] disk_error; // out of bounds (?)
   logic [7:0]           disk_data[TOT_DISKS];
   logic [7:0]           disk_din;
+
+
+// ADAM printer (AdamNet device 2) out through the HPS UART. When the OSD's UART
+// connection is Printer (mode 7), mister_printerd reads the stream and writes a PDF;
+// in any other mode the bytes are dropped rather than sent into, say, the Linux
+// console on that port, and the ADAM prints as if nothing were attached.
+wire [7:0] prn_data;
+wire       prn_strobe;
+wire       prn_ready;
+
+wire prn_txd;
+
+cv_printer_uart #(.CLK_HZ(42_666_000)) printer_uart
+(
+        .clk(clk_sys),
+        .reset(RESET),
+        .enable(uart_mode == 8'd7),
+        .baud(uart_speed),
+        .din(prn_data),
+        .wr(prn_strobe),
+        .ready(prn_ready),
+        .txd(prn_txd)
+);
+
+// FujiNet (UART connection mode 8; fuji_en is defined with the reset above). FujiNet-PC runs
+// on the HPS as a set of AdamNet devices on /dev/ttyS1, and cv_adamnet speaks the AdamNet
+// wire protocol to it through this UART at the speed Main reports for the mode. The printer's
+// transmitter and this one share UART_TXD; the mode says which drives it.
+wire [7:0] fuji_tx_data;
+wire       fuji_tx_wr, fuji_tx_busy;
+wire [7:0] fuji_rx_data;
+wire       fuji_rx_avail, fuji_rx_rd, fuji_rx_flush;
+wire       fuji_txd;
+
+cv_fuji_uart #(.CLK_HZ(42_666_000)) fuji_uart
+(
+        .clk(clk_sys),
+        .reset(RESET),
+        .enable(fuji_en),
+        .baud(uart_speed),
+        .tx_data(fuji_tx_data),
+        .tx_wr(fuji_tx_wr),
+        .tx_busy(fuji_tx_busy),
+        .rx_data(fuji_rx_data),
+        .rx_avail(fuji_rx_avail),
+        .rx_rd(fuji_rx_rd),
+        .rx_flush(fuji_rx_flush),
+        .rx_err(),
+        .txd(fuji_txd),
+        .rxd(UART_RXD)
+);
+
+assign UART_TXD = fuji_en ? fuji_txd : prn_txd;
 
 cv_console
     #
@@ -815,12 +929,30 @@ cv_console
         .ramb_wr_ack(ramb_wr_ack),
         .ramb_rd_ack(ramb_rd_ack),
 
+        .prn_data(prn_data),
+        .prn_strobe(prn_strobe),
+        .prn_ready(prn_ready),
+
+        .fuji_en(fuji_en),
+        .fuji_boot_cfg(fuji_boot_cfg),
+        .fuji_boot_cfg_ack(fuji_boot_cfg_ack),
+        .fuji_tx_data(fuji_tx_data),
+        .fuji_tx_wr(fuji_tx_wr),
+        .fuji_tx_busy(fuji_tx_busy),
+        .fuji_rx_data(fuji_rx_data),
+        .fuji_rx_avail(fuji_rx_avail),
+        .fuji_rx_rd(fuji_rx_rd),
+        .fuji_rx_flush(fuji_rx_flush),
+
         .vram_a_o(vram_a),
         .vram_we_o(vram_we),
         .vram_d_o(vram_do),
         .vram_d_i(vram_di),
 
         .cart_pages_i(cart_pages),
+        .cart_ocm_i(cart_ocm),
+        .cart_wr_o(cart_wr),
+        .cart_wd_o(cart_wd),
         .cart_a_o(cart_a),
         .cart_d_i(cart_d),
         .cart_rd(cart_rd),

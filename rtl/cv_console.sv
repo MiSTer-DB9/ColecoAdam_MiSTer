@@ -65,6 +65,7 @@ module cv_console
    parameter     NUM_DISKS    = 1,
    parameter     NUM_TAPES    = 4,
    parameter     USE_REQ      = 1,
+   parameter     CLK_HZ       = 42_666_000,  // clk_i, for the FujiNet master's timeouts
    parameter     TOT_DISKS    = NUM_DISKS + NUM_TAPES
    )
   (
@@ -134,6 +135,21 @@ module cv_console
    input        [7:0]           ramb_din,
    input                        ramb_wr_ack,
    input                        ramb_rd_ack,
+   // AdamNet printer: one byte per prn_strobe, fetched only while prn_ready
+   output logic [7:0]           prn_data,
+   output logic                 prn_strobe,
+   input                        prn_ready,
+   // FujiNet: AdamNet wire bytes to and from cv_fuji_uart at the top level
+   input                        fuji_en,
+   input                        fuji_boot_cfg,      // OSD: put FujiNet's CONFIG back in slot 1
+   output logic                 fuji_boot_cfg_ack,
+   output logic [7:0]           fuji_tx_data,
+   output logic                 fuji_tx_wr,
+   input                        fuji_tx_busy,
+   input [7:0]                  fuji_rx_data,
+   input                        fuji_rx_avail,
+   output logic                 fuji_rx_rd,
+   output logic                 fuji_rx_flush,
 
    // Video RAM Interface ----------------------------------------------------
    output [13:0]                vram_a_o,
@@ -153,6 +169,11 @@ module cv_console
 	// is block RAM, as the simulator does by default.
 	input                        exp_wait_n_i,
         input [5:0]                  cart_pages_i,
+        // Opcode Super Game Cartridge (cv_cart_detect): OCM banking and its flash chip, which
+        // writes the cartridge image at cart_a_o.
+        input                        cart_ocm_i,
+        output                       cart_wr_o,
+        output [7:0]                 cart_wd_o,
    // extended ROM Interface ------------------------------------------------
    output [19:0]                ext_rom_a_o,
    input [7:0]                  ext_rom_d_i,
@@ -255,7 +276,11 @@ module cv_console
   logic          ctrl_r_n_s;
   logic          ctrl_en_key_n_s;
   logic          ctrl_en_joy_n_s;
-  logic [5:0]    cart_page_s;
+  logic [6:0]    cart_bank_s;
+  logic          cart_flash_wr_s;
+  logic          flash_busy_s, flash_wr_s;
+  logic [7:0]    flash_status_s;
+  logic [19:0]   flash_a_s;
   logic          ram_mirror_s;
   logic          adamnet_ram_s;
   assign adamnet_ram_s = ~ram_ce_n_s | ~upper_ram_ce_n_s;
@@ -311,17 +336,20 @@ module cv_console
   assign clk_en_3m58_n_s = (clk_cnt_q == 2'b10) ? clk_en_10m7_i : '0;
 
   //---------------------------------------------------------------------------
-  // T80 CPU
+  // Z80 CPU: t80sv_T80pa (rtl/t80sv), Mode 0. A SystemVerilog translation of T80,
+  // the CPU of Arnim Laeuger's original ColecoVision core, with fixes that pass every
+  // SingleStepTests/z80 case including bus cycle order and strobe positions
+  // (rtl/t80sv/README.md). Both clock phases drive it, so its strobes have the Z80's
+  // half T-state shapes (UM0080 Figs. 5-8). Define CPU_TV80 to build with tv80e instead,
+  // the CPU this core used until 2026-11, which has one-T-state strobes.
   //---------------------------------------------------------------------------
 
-//  `ifdef VERILATOR
-
+`ifdef CPU_TV80
   tv80e Cpu
     (
      .reset_n     (reset_n_s),
      .clk         (clk_i),
      .cen         (clk_en_3m58_p_s),
-     //.cen_n(clk_en_3m58_n_s),
      .wait_n      (wait_n_s),
      .int_n       (int_n_s),
      .nmi_n       (nmi_n_s),
@@ -338,33 +366,35 @@ module cv_console
      .di          (d_to_cpu_s),
      .dout        (d_from_cpu_s)
      );
-/*
-  `else
-
-  T80pa #(.mode(0)) t80a_b(
-                           .reset_n(reset_n_s),
-                           .clk(clk_i),
-                           .cen_p(clk_en_3m58_p_s),
-                           .cen_n(clk_en_3m58_n_s),
-                           .wait_n(wait_n_s),
-                           .int_n(int_n_s),
-                           .nmi_n(nmi_n_s),
-                           .busrq_n((USE_REQ == 1) ? adamnet_req_n : vdd_s),
-                           .m1_n(m1_n_s),
-                           .mreq_n(mreq_n_s),
-                           .iorq_n(iorq_n_s),
-                           .rd_n(rd_n_s),
-                           .wr_n(wr_n_s),
-                           .rfsh_n(rfsh_n_s),
-                           .halt_n(),
-                           .busak_n(adamnet_ack_n),
-                           .a(a_s),
-                           .di(d_to_cpu_s),
-                           .dout(d_from_cpu_s)
-                           );
-
+`else
+  t80sv_T80pa #(.Mode(0)) Cpu
+    (
+     .RESET_n     (reset_n_s),
+     .CLK         (clk_i),
+     .CEN_p       (clk_en_3m58_p_s),
+     .CEN_n       (clk_en_3m58_n_s),
+     .WAIT_n      (wait_n_s),
+     .INT_n       (int_n_s),
+     .NMI_n       (nmi_n_s),
+     .BUSRQ_n     ((USE_REQ == 1) ? adamnet_req_n : vdd_s),
+     .M1_n        (m1_n_s),
+     .MREQ_n      (mreq_n_s),
+     .IORQ_n      (iorq_n_s),
+     .RD_n        (rd_n_s),
+     .WR_n        (wr_n_s),
+     .RFSH_n      (rfsh_n_s),
+     .HALT_n      (),
+     .BUSAK_n     (adamnet_ack_n),
+     .OUT0        (1'b0),
+     .A           (a_s),
+     .DI          (d_to_cpu_s),
+     .DO          (d_from_cpu_s),
+     .R800_mode   (1'b0),
+     .REG         (),
+     .DIRSet      (1'b0),
+     .DIR         (212'd0)
+     );
 `endif
-*/
 
 
   //---------------------------------------------------------------------------
@@ -446,6 +476,17 @@ module cv_console
   //---------------------------------------------------------------------------
 `ifdef VERILATOR
   assign psg_ready_s=1;
+  // No sound in the simulator, but the Super Game Module's AY has to answer register reads:
+  // Opcode's cartridges check that what they write to it reads back before they start.
+  YM2149 psg_b_sim (
+    .CLK(clk_i), .CE(clk_en_3m58_p_s), .RESET(~reset_n_s),
+    .BDIR((~ay_addr_we_n_s) | (~ay_data_we_n_s)),
+    .BC((~ay_addr_we_n_s) | (~ay_data_rd_n_s)),
+    .DI(d_from_cpu_s), .DO(ay_d_s),
+    .CHANNEL_A(), .CHANNEL_B(), .CHANNEL_C(),
+    .SEL(1'b0), .MODE(1'b0), .ACTIVE(),
+    .IOA_in(8'hFF), .IOA_out(), .IOB_in(8'hFF), .IOB_out()
+  );
 `else
 
  sn76489_audio #(.FAST_IO_G(1'b0),.MIN_PERIOD_CNT_G(17)) psg_a(
@@ -509,7 +550,9 @@ module cv_console
                          .a_i(a_s),
                          .d_i(d_from_cpu_s),
                                                                  .cart_pages_i(cart_pages_i),
-                         .cart_page_o(cart_page_s),
+                         .ocm_i(cart_ocm_i),
+                         .cart_bank_o(cart_bank_s),
+                         .cart_wr_o(cart_flash_wr_s),
                          .iorq_n_i(iorq_n_s),
                          .rd_n_i(rd_n_s),
                          .wr_n_i(wr_n_s),
@@ -557,7 +600,8 @@ module cv_console
     #
     (.NUM_DISKS (NUM_DISKS),
      .NUM_TAPES (NUM_TAPES),
-     .USE_REQ   (USE_REQ)
+     .USE_REQ   (USE_REQ),
+     .CLK_HZ    (CLK_HZ)
      )
   adamnet
     (
@@ -603,12 +647,27 @@ module cv_console
      .disk_data,
      .disk_din,
 
+     .prn_data,
+     .prn_strobe,
+     .prn_ready,
+
      .adamnet_req_n,
      .adamnet_ack_n,
 
      .adamnet_wait_n,
      .adamnet_sel,
      .adamnet_dout,
+
+     .fuji_en,
+     .fuji_boot_cfg,
+     .fuji_boot_cfg_ack,
+     .fuji_tx_data,
+     .fuji_tx_wr,
+     .fuji_tx_busy,
+     .fuji_rx_data,
+     .fuji_rx_avail,
+     .fuji_rx_rd,
+     .fuji_rx_flush,
 
      .ps2_key
      );
@@ -632,7 +691,26 @@ module cv_console
   assign cpu_lowerexpansion_ram_rd_n_o = rd_n_s;
   assign cpu_expansion_ram_rd_n_o = rd_n_s;
   assign cpu_upper_ram_rd_n_o = rd_n_s;
-  assign cart_rd = ~cartridge_rom_ce_n_s;
+  // While the flash erases a sector it answers reads with its status and the memory is busy
+  // with the erase, so CPU reads of the cartridge don't reach it.
+  assign cart_rd = ~cartridge_rom_ce_n_s & ~flash_busy_s;
+
+  cv_ocm_flash ocm_flash_b (
+    .clk_i(clk_i),
+    .reset_n_i(reset_n_i),
+    .en_i(cart_ocm_i),
+    .wr_i(cart_flash_wr_s),
+    .rd_i(~cartridge_rom_ce_n_s & ~rd_n_s),
+    .a_i({cart_bank_s, a_s[12:0]}),
+    .d_i(d_from_cpu_s),
+    .ready_i(cart_ready_i),
+    .busy_o(flash_busy_s),
+    .status_o(flash_status_s),
+    .mem_wr_o(flash_wr_s),
+    .mem_a_o(flash_a_s),
+    .mem_d_o(cart_wd_o)
+  );
+  assign cart_wr_o = flash_wr_s;
 
   //---------------------------------------------------------------------------
   // Bus multiplexer
@@ -685,7 +763,7 @@ module cv_console
     if (~expansion_ram_ce_n_s)  d_expansion_ram_v = cpu_expansion_ram_d_i;
     if (~upper_ram_ce_n_s)      d_upper_ram_v = adamnet_sel ? adamnet_dout : cpu_upper_ram_d_i;
     if (~expansion_rom_ce_n_s)  d_expansion_rom_v = ext_rom_d_i;
-    if (~cartridge_rom_ce_n_s)  d_cartridge_rom_v = cart_d_i;
+    if (~cartridge_rom_ce_n_s)  d_cartridge_rom_v = flash_busy_s ? flash_status_s : cart_d_i;
     if (~vdp_r_n_s)             d_vdp_v  = d_from_vdp_s;
     if (~ctrl_r_n_s)            d_ctrl_v = d_to_ctrl_s;
          if (~ay_data_rd_n_s)        d_ay_v   = ay_d_s;
@@ -763,6 +841,6 @@ end
   assign cpu_lowerexpansion_ram_d_o       = d_from_cpu_s;
   assign cpu_expansion_ram_d_o       = d_from_cpu_s;
   assign cpu_upper_ram_d_o = d_from_cpu_s;
-  assign cart_a_o ={cart_page_s, a_s[13:0]};
+  assign cart_a_o = flash_a_s;   // {cart_bank_s, a_s[12:0]}, or the sector being erased
 
 endmodule

@@ -8,6 +8,14 @@ This core is a conversion of the Colecovision core into verilog. Adam support wa
  * DSK - Coleco Adam disks in various formats
  * DDP - Coleco Adam Data Packs
 
+### Opcode Super Game Cartridges
+
+Opcode's recent Super Game Module releases on its own flash cartridge - Gradius, Mooncresta,
+Pac-Man DX, DK Arcade, DK Jr. Arcade, Amidar - run in Console mode. The core recognises them from
+the image itself (no setting to change) and emulates the cartridge's bank registers and the flash
+chip the games save high scores and options to. Saves survive a reset but not reloading the
+cartridge or the core; they are not yet written back to the SD card.
+
 ### Expansion RAM
 
 The OSD's **Expansion RAM** option fits a memory expander: **64K, 256K, 512K, 1M, 2M or None**.
@@ -39,7 +47,6 @@ say. Set it again in the OSD and re-save.
 ### Known Bugs
 
  * reset doesn't work quite the same as Adam
- * no printer support
  * key repeat doesn't match original
 
 Fixed since this list was written: the bad character on the first keystroke; disk writes -
